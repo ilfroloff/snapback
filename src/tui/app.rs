@@ -2751,8 +2751,9 @@ pub struct App {
     /// DERIVED, IN-MEMORY state: it describes another program's binary, snapback
     /// owns none of it, and nothing here ever reaches disk. AGENTS.md settles that
     /// category twice over — THE PARSE CACHE keeps derived state in memory, and
-    /// SNAPBACK-OWNED STATE keeps the per-session state map the only thing
-    /// snapback persists. Written only by
+    /// SNAPBACK-OWNED STATE keeps the per-session state map the only persistent
+    /// state snapback writes (the paste cache is prunable cache beside it).
+    /// Written only by
     /// [`set_model_aliases`](Self::set_model_aliases),
     /// from [`AppEvent::ModelAliases`](crate::watch::AppEvent::ModelAliases); read
     /// only by [`offered_model_aliases`], which decides what the picker offers.
@@ -2826,6 +2827,22 @@ pub struct App {
     /// [`forget_catalog_fetches_in_flight`](Self::forget_catalog_fetches_in_flight)
     /// when the board session ends.
     pub(crate) catalogs_in_flight: HashSet<PathBuf>,
+    /// The last clipboard-attach token handed out by `compose::request_attach`.
+    /// Monotonic for the board session, so a result for a compose that has since
+    /// closed or been replaced never matches the new compose's token.
+    pub(crate) attach_token: u64,
+    /// The last attachment-placeholder number `compose::finish_attach` handed out
+    /// (`[Image #N]`, `[<file name> #N]`). Monotonic for the `App` and never reset —
+    /// `ComposeState::new` never touches it — and the `App` outlives every hand-off
+    /// (`tui::run` takes `&mut App`), so a placeholder copied out of one box can
+    /// never name another box's attachment.
+    pub(crate) attachment_number: u64,
+    /// The saved images of clipboard results `compose::finish_attach` DROPPED,
+    /// waiting for the driver to delete them. Recorded, never deleted, there:
+    /// that handler runs on the UI thread, so `tui::run_inner` drains this
+    /// (`compose::take_stale_paste_images`) into
+    /// `clipboard::spawn_paste_image_discard`. In memory only.
+    pub(crate) stale_paste_images: Vec<PathBuf>,
     /// Indices (into `sessions`) that pass the scope predicate, cached so a
     /// per-keystroke query re-filter never re-canonicalizes paths.
     scoped: Vec<usize>,
@@ -3326,6 +3343,9 @@ impl App {
             // a reply's `@` agents come from its transcript and a draft's has none.
             catalogs: HashMap::new(),
             catalogs_in_flight: HashSet::new(),
+            attach_token: 0,
+            attachment_number: 0,
+            stale_paste_images: Vec::new(),
             scoped: Vec::new(),
             population: Vec::new(),
             expanded: HashSet::new(),
@@ -4651,6 +4671,15 @@ impl App {
     pub fn set_status_transient(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
         self.status_ttl = Some(STATUS_DWELL_TICKS);
+    }
+
+    /// Whether the status line holds a **sticky** message (one with no dwell
+    /// timer), which a later transient note must not replace. A refusal or failure
+    /// is one; so is a confirmation that is deliberately sticky (the `Ctrl-X y`
+    /// copy's line, a lineage delete's or move's tally), which a transient note
+    /// therefore yields to as well.
+    pub fn has_sticky_status(&self) -> bool {
+        self.status.is_some() && self.status_ttl.is_none()
     }
 
     /// Clear any board status and its dwell timer. Called at the start of

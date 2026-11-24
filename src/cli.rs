@@ -76,9 +76,12 @@ KEYS:
     Ctrl-N        new session in the launch dir: pick an agent when any are
                   defined, then draft the session's first message — Enter starts
                   it as a BACKGROUND agent without leaving the board, Ctrl-O runs
-                  it interactively instead, Ctrl-L picks its model, Ctrl-J or
+                  it interactively instead, Ctrl-L picks its model, Ctrl-V
+                  attaches a file or screenshot (Enter and Ctrl-O wait while it
+                  reads; Esc cancels the read before the draft), Ctrl-J or
                   Alt+Enter newline, Esc cancels, and / or @ opens the pick
-                  list (below). The message is sent as the first turn either way
+                  list (below). The message is sent as the first turn either
+                  way
     Ctrl-O        in the agent picker: start that agent interactively at once,
                   skipping the draft — the same verb Ctrl-O has inside the draft
     Ctrl-X        leader chord: x hide (from a row showing (+N) or ↳ rows
@@ -98,7 +101,9 @@ KEYS:
                   (another box, a picker or a prompt); Ctrl-O forks it
                   interactively (an empty box is a plain fork, plus --effort
                   when the session's last turn recorded one; the message
-                  auto-submits), Ctrl-L picks the model, Ctrl-J or Alt+Enter
+                  auto-submits), Ctrl-L picks the model, Ctrl-V attaches a file
+                  or screenshot (Enter and Ctrl-O wait while it reads; Esc
+                  cancels the read before the box), Ctrl-J or Alt+Enter
                   newline, Esc cancels, and / or @ opens the pick list
                   (below). Either way the fork is named 'fork: <first line of
                   the message>' ('fork: <session label>' for an empty box) and
@@ -146,8 +151,10 @@ KEYS:
                   fork from the Ctrl-X f box's Enter, the fork itself), or the
                   session is being moved (Ctrl-X w), Ctrl-R on that session is
                   refused until it lands; other rows can still reply
-                  (Enter sends, Ctrl-L picks the model, Ctrl-J or Alt+Enter
-                  newline, Esc cancels, and / or @ opens the pick list below)
+                  (Enter sends, Ctrl-L picks the model, Ctrl-V attaches a file
+                  or screenshot and Enter waits while it reads, Ctrl-J or
+                  Alt+Enter newline, Esc cancels — a read still pending first,
+                  then the box — and / or @ opens the pick list below)
     Ctrl-L        in a reply, fork or draft box: pick the model, and optionally the
                   effort, for THIS message only. The box names what it will run
                   on — a reply or fork 'model: session (<model>)', the model its session
@@ -162,6 +169,43 @@ KEYS:
                   nothing is remembered. Enter (resume), the Attach/Fork
                   choice, Attach and the Ctrl-X w move never send a model or an
                   effort, and claude does not keep an effort for a later resume
+    Ctrl-V        in a reply, fork or draft box: attach what the OS clipboard
+                  holds. Copied file(s) of any type go in first, each in place
+                  and shown in the box as [<file name> #N]; otherwise an image
+                  (PNG, JPEG, GIF or WebP) is saved under
+                  ~/.config/snapback/cache/paste/ ($SNAPBACK_CONFIG_DIR; files
+                  there are pruned after 7 days) and shown as [Image #N]. N
+                  counts up across the board. The message sent carries each
+                  one still in your text as @\"<path>\", which claude attaches
+                  itself: text, images, PDFs and folders are read, other
+                  binaries only named. The box reads attaching… meanwhile.
+                  When nothing is attached your text stays as it was and the
+                  status line says why until your next key: the clipboard holds
+                  only text (use your terminal's own paste, Cmd+V /
+                  Ctrl-Shift-V), it is empty, the image format is unsupported,
+                  the image is over 25 MiB, you are on SSH, there is no
+                  display, the clipboard tool is missing, or the read failed
+                  (timed out or errored). A copied file whose path a mention
+                  can't carry is named with why, while the other files still
+                  go in; an image whose saved path can't be carried is named
+                  the same way and not saved. Copied files that go in are
+                  confirmed briefly on the status line, 'attached \"<full path>\"'
+                  (the first, quoted and escaped, '(+N more)' for several),
+                  never over a refusal or other sticky line; an image gets
+                  none. One attach at a time:
+                  Ctrl-V again only nudges, and so do Enter, which sends
+                  nothing until the attachment lands, and a fork's or draft's
+                  Ctrl-O, which runs nothing until then (a Cmd+V file check
+                  never holds either). Esc while it reads cancels the attach
+                  and keeps your text; Esc again closes the box (an open pick
+                  list takes the first Esc). Needs osascript (built in) on
+                  macOS, wl-paste (wl-clipboard) or xclip on Linux.
+                  Cmd+V also attaches most copied files where your terminal
+                  pastes their path on one line (see paste below), and an image
+                  where it sends an empty paste (VS Code, Cursor); iTerm2 and
+                  JetBrains terminals send nothing for an image, so use Ctrl-V
+                  there. A terminal that binds Ctrl-V as its own paste never
+                  delivers it: use Cmd+V / Ctrl-Shift-V or the empty-paste path
     ←/→           in the model picker: step the highlighted model's effort
                   through default → low → medium → high → xhigh → max, wrapping,
                   sent as --effort beside --model; Enter sets both into the box,
@@ -257,15 +301,28 @@ KEYS:
                   a path or a branch name goes in one press. Ctrl-W and Alt+H do
                   the same, so it works whatever your terminal sends for
                   Option, and it is the same set the reply box word-deletes on
-    paste         your terminal's own paste (Cmd/Ctrl-V, middle-click) is inserted
-                  as TEXT: into a compose draft at the cursor, newlines and all, or
-                  into the search query (or the find bar, while it is open) at its
-                  cursor with newlines flattened to spaces. It never sends,
-                  resumes, or answers a confirmation.
+    paste         your terminal's own paste (Cmd+V / Ctrl-Shift-V, middle-click)
+                  is inserted as TEXT: into a compose draft at the cursor,
+                  newlines and all, or into the search query (or the find bar,
+                  while it is open) at its cursor with newlines flattened to
+                  spaces. It never sends, resumes, or answers a confirmation.
                   A draft paste is cut at the size one claude argument can be
                   (about 128 KB on Linux, 768 KB on macOS) and says so; a longer
                   message is refused on Enter in any box and on Ctrl-O in a fork
-                  or draft box, the box kept
+                  or draft box, the box kept.
+                  In a compose box, Cmd+V of copied files (where the terminal
+                  pastes their path or name on one line) becomes their
+                  [<file name> #N] placeholders, sent as @\"<path>\" (see Ctrl-V
+                  above, with the same 'attached \"<full path>\"' status line); if
+                  one cannot be attached, the paste stays as text
+                  and the status line says which and why. A bare name with a
+                  space or no lettered extension, and a paste naming a URI
+                  scheme other than file (https:, mailto:), stay text: use
+                  Ctrl-V for those files. A few text pastes still make snapback
+                  check the clipboard, and stay text: a slash command such as
+                  /compact, a bare /, or a dotted word such as example.com,
+                  a@b.com or node.js. An empty paste acts as Ctrl-V (see Ctrl-V
+                  above)
     Esc           close the find bar; else clear the search query; with none
                   typed, leave a subagent's transcript for the session's own;
                   with none of those, quit

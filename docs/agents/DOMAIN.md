@@ -30,6 +30,9 @@ environment for any snapback-owned path:
    `dirs::home_dir()` joined with `.config`; home-less fallback is a relative
    `.config/snapback`, never a panic.
 2. `config::state_dir()` = `config_dir()/state`, where persistent state lives.
+3. `config::paste_cache_dir()` = `config_dir()/cache/paste`, the
+   [compose attach](#the-paste-cache)'s saved clipboard images: prunable CACHE,
+   never read back, so the map below stays the only persistent state.
 
 The map is a single file, `<config>/state/sessions.json` (default
 `~/.config/snapback/state/sessions.json`): a JSON object keyed by session id, each
@@ -2362,7 +2365,7 @@ between the launch and the hand-back — two headers driving ONE node, opened in
 place together — is retired, so the hand-back stays a fold of its own and its
 key opens the hand-back alone. Which nodes are open lives in
 `tui::app`'s `expanded_peers`, IN MEMORY for the run — the per-session state map
-above stays the only thing snapback persists. A record that passes the gate but
+above stays snapback's only persistent state. A record that passes the gate but
 carries no `from` has no key, so it claims no click region and renders EXPANDED:
 a collapsed node nobody can click would put its body permanently out of reach.
 The same set also holds the [injected nodes'](#injected-context-node-storepreview)
@@ -3428,7 +3431,10 @@ narrow it by the [rule below](#how-the-letters-narrow-the-list):
   `Up`/`Down` choose (wrapping), `Enter`/`Tab` pick, `Esc` closes only the list. A
   closed token stays closed while the caret stays at its end (typing more of it
   included); it reopens once the caret leaves the end of the token or a different
-  token is under it (`CompletionState::dismissed` is cleared then). With no
+  token is under it (`CompletionState::dismissed` is cleared then). It never
+  opens on a token that overlaps an attachment placeholder either, whether the
+  token starts inside it, ends inside it or holds it
+  ([attach](#compose-attach-ctrl-v)). With no
   candidate the keys are the ordinary compose keys.
 - Fail-soft: a missing, unreadable or malformed transcript or folder is an empty
   list, and a missing `claude` or a bad handshake answer only leaves the list as
@@ -3805,6 +3811,454 @@ marks nothing: a fact on the bar, never on the status line. The text is
 not persisted. A hit inside a collapsed `◆` / `◇` node is not drawn and so not
 findable until the node is clicked open.
 
+### Compose attach (`Ctrl-V`)
+
+Code: `src/tui/compose.rs` (the request, the token, the finish, the expansion),
+`src/tui/complete.rs` (the mention, the attachment placeholder, the `@` boundary),
+`src/tui/clipboard.rs` (the route, the read, the cache), `src/config.rs` (where
+the cache lives).
+
+`Ctrl-V` in EVERY compose box — the `Ctrl-R` reply, the `Ctrl-X f` fork and the
+`Ctrl-N` draft, pick list open or closed — is `compose::ComposeAction::AttachClipboard`:
+it attaches what the OS clipboard holds, as an attachment placeholder in the
+draft and an `@"<absolute path>"` mention in the message sent. Two terminal
+pastes ask the same question
+([below](#terminal-paste-routing-eventpaste)). TEXT stays the terminal's own paste.
+
+**The request.** No key handler reads the clipboard or spawns. `compose::request_attach`
+records a `PendingAttach { token, requested, purpose }` on the open `ComposeState`,
+under a fresh token from `App::attach_token` (monotonic for the `App`, so a result
+for a compose that has since closed or been replaced never matches a newer one).
+After every wake-up the run loop asks the pure `compose::take_clipboard_read`,
+which hands an un-requested attach to the driver ONCE, as `(token, ReadMode)`. The
+driver (`tui::start_clipboard_read`) picks the route
+(`clipboard::clipboard_read_route` over `ClipboardEnv::from_env`) and starts
+`clipboard::spawn_clipboard_read`, whose thread delivers exactly ONE
+`AppEvent::ClipboardRead { token, result }` — or, over SSH or with no display,
+sends that event's refusal at once and spawns nothing. `update::dispatch` hands
+the event to `compose::finish_attach`.
+
+- **One attach at a time.** A `Ctrl-V` or an empty paste while a read is pending
+  only nudges (`ATTACH_BUSY_HINT`, transient). The silent copied-file check below
+  is the exception: an explicit attach SUPERSEDES it, and the check's late result
+  carries a token nobody holds any more.
+- **`Enter` and `Ctrl-O` wait for an explicit read.** While the box's own
+  `Explicit` read is pending — requested by the driver or not yet, exactly while
+  the `attaching…` mark shows — `Enter` in the `Ctrl-R` reply, the `Ctrl-X f` fork
+  and the `Ctrl-N` draft alike sends, forks and launches NOTHING, and `Ctrl-O` in
+  the fork and the draft hands off NOTHING: each nudges in its own words
+  (`compose::ENTER_WHILE_ATTACHING_HINT`, `compose::CTRL_O_WHILE_ATTACHING_HINT`,
+  both transient) and leaves the box, the draft, the pending read and its token
+  exactly as they were, so neither key leaves without the attachment just asked
+  for. The decision is ONE pure `compose::submit_waits_for_attach`, asked in
+  `handle_compose_key`'s `Send` arm before `submit_compose`, so it comes before
+  every other `Enter` route of the three boxes (the empty-message nudges
+  included), and in `compose::open_interactive` right after the reply's no-op,
+  so it comes before every `Ctrl-O` hand-off route (the launch gates included)
+  while a reply's `Ctrl-O` stays inert, with no nudge. The silent check NEVER
+  holds either key: the paste is already in the draft as text and goes as typed,
+  and its late result is dropped by the stale-token rule. `Enter` with the pick
+  list open picks a row and is not gated.
+- **`Esc` cancels an explicit read before the box.** While that same `Explicit`
+  read is pending, `Esc` with the pick list closed — in the `Ctrl-R` reply, the
+  `Ctrl-X f` fork and the `Ctrl-N` draft alike — drops it (`pending_attach` back to
+  `None`) and keeps the box, its draft byte-identical, caret included, under a
+  transient nudge (`compose::ATTACH_CANCELLED_HINT`). The read's late result then
+  carries a token nobody holds, and a second `Esc` cancels the box. The decision
+  is ONE pure `compose::esc_cancels_attach`, asked in `handle_compose_key`'s
+  `Cancel` arm and true for exactly the read `submit_waits_for_attach` holds
+  `Enter` and `Ctrl-O` for, so a read that holds the box always has a key that
+  releases it — on Linux a hung clipboard owner can hold it for every step's
+  `CLIPBOARD_READ_TIMEOUT` plus its grace. `Esc` unwinds one layer per press: an
+  open pick list first (`ComposeAction::CloseCompletion`, the read untouched),
+  then the read, then the box. The silent check is no read to cancel: with only
+  it pending, `Esc` cancels the box at once.
+- **In flight** is typed state on the box: its bottom border reads `attaching…`
+  (`compose::ATTACHING_LABEL`) while an `Explicit` read is pending
+  (`PendingAttach::shows_mark`), never for the silent check and never on the
+  status line.
+- **Stale tokens.** `finish_attach` drops a result unless a compose is open AND
+  its pending attach holds that token, so an `Esc` (on the read or on the box), a
+  send, a launch or another compose opening leaves nothing a late result could
+  touch. A hand-off closes the compose, its pending attach included, with the
+  board session (`update::handle_event`), and the read's result then dies with
+  that session's channel. A DROPPED result records no attachment and takes no
+  placeholder number, so a dropped `Image` result's cache file is attached to no
+  draft, and it is deleted, never on the UI thread: `finish_attach` only records
+  its path (`App::stale_paste_images`), and the run loop drains it after every
+  wake-up (`compose::take_stale_paste_images`) into
+  `clipboard::spawn_paste_image_discard`, a detached thread the driver starts that
+  reports no event, the shape of the board-start prune. It deletes only a regular
+  file, never a symlink, directly in `config::paste_cache_dir()` under a name
+  `is_paste_cache_name` accepts (`clipboard::is_discardable_paste_image`), and it
+  is fail-soft: a failed delete, or a result that never reaches `finish_attach`
+  (one that dies with a session's channel), is left to the 7-day
+  [prune](#the-paste-cache). No other result deletes anything: `Unmentionable`
+  wrote no file, and `Files` are the user's own.
+
+**What a read attaches** (`clipboard::choose_read`, one pure function):
+
+| Clipboard holds | Result |
+| --- | --- |
+| copied file(s), of any type, even beside an image (a Finder copy carries the file's icon) | `Files`: each referenced IN PLACE, never copied |
+| else an image type claude reads | `Image`: saved under [the paste cache](#the-paste-cache), then attached as `[Image #N]`; `Unmentionable`, nothing saved, when no mention can carry its cache path |
+| else an image type outside that set: an `image/*` MIME target on Linux (`clipboard::MIME_IMAGE_PREFIX`; an `image/bmp`, say), or on macOS one of `clipboard::MACOS_UNREADABLE_IMAGE_TYPES` (a `com.microsoft.bmp` or a `public.heic`, say) | `UnsupportedImage`, never `Nothing` |
+| else text (a `text/*` type, `clipboard::MIME_TEXT_PREFIX`, or one of `clipboard::TEXT_TYPES`) | `TextOnly` |
+| else | `Nothing` |
+
+The image types, best first (`clipboard::IMAGE_TYPES`): PNG, then JPEG, then
+GIF, then WebP. Linux reads the MIME targets `image/png`, `image/jpeg`,
+`image/gif` and `image/webp` RAW, each saved under its own extension. macOS lists
+pasteboard types (UTIs): `public.png` and `public.jpeg` are converted to PNG
+through `«class PNGf»`, `com.compuserve.gif` and `org.webmproject.webp` are read
+RAW and keep their format, and `public.tiff` (through `«class PNGf»` too) ranks
+LAST, because macOS lists a synthesized TIFF beside a GIF or a WebP (measured on
+macOS 27.0.1, 2026-10-11), which a higher rank would shadow. A macOS UTI carries
+no shared prefix the way a MIME `image/` target does, so the unreadable ones are
+listed by name in `MACOS_UNREADABLE_IMAGE_TYPES`: each declared and conforming to
+`public.image` per `UTType` on macOS 27.0.1, 2026-10-11, and each asked only after
+`IMAGE_TYPES`, so a `public.tiff` macOS lists beside one still converts. HEIC is
+one of them: a `public.heic` with nothing convertible beside it is
+`UnsupportedImage`.
+
+**Refusals.** Every result that attaches nothing leaves the draft byte-identical
+and sets its OWN sticky status (`compose::attach_refusal`, or, for the one that
+names a path, `compose::refusal_status`):
+
+| Result | Cause | Status |
+| --- | --- | --- |
+| `TextOnly` | only text | `clipboard holds text only — paste it with ⌘V / Ctrl-Shift-V (Ctrl-V attaches files and images)` |
+| `Nothing` | an empty clipboard | `nothing to attach — the clipboard is empty` |
+| `UnsupportedImage` | an image type claude cannot read | `that image format is not supported — copy a PNG, JPEG, GIF or WebP` |
+| `TooLarge` | an image over `PASTE_IMAGE_MAX_BYTES` (25 MiB) | `that image is too large to attach` |
+| `RemoteSession` | SSH (either witness): a local tool would read the REMOTE clipboard | `cannot read the clipboard over SSH — it would be the remote machine's` |
+| `NoDisplay` | Linux with neither Wayland nor X11, or another OS | `no display to read a clipboard from` |
+| `NoTool` | the read tool could not be started (not installed) | `clipboard tool not found — install wl-clipboard (Wayland) or xclip (X11)` |
+| `Failed` | a timeout, a non-zero exit, an unfinished or over-cap listing, an empty or unwritable image | `could not read the clipboard` |
+| `Unmentionable` | an image whose cache path `file_mention` refuses (a `#` or `"` in the config dir, say), asked BEFORE anything is written ([the paste cache](#the-paste-cache)) | `not attached: "<path>" — <cause>`, the line a refused copied file gets (below) |
+
+**The attachment placeholder.** The draft never shows an attachment's path. Each
+attachment goes in at the caret as a short placeholder, worded ONLY by
+`complete::attachment_placeholder`: `[Image #N]` for a clipboard image (never the
+cache file's name) and `[<file name> #N]` for a copied file (`[report.pdf #2]`; a
+path with no file name shows whole). `complete::mention_insert_text` spaces them:
+led by one space unless the caret is at a line start or follows a
+[mention boundary](#the-mention-boundary) character (the mention that takes the
+placeholder's place must not be glued to a word), joined by one space, and ALWAYS
+ended by one, so the [pick list](#compose-pick-list) never reads what precedes
+the caret as an open `@` token. Nor does it open on a token that OVERLAPS a
+placeholder an entry still derives, whether the token starts inside it, ends
+inside it or holds it. A file name holding two spaces in a row lets an `@` typed
+between them read as a token of its own, and an `@` typed inside a name and
+walked to the name's end reads as one made of typed characters and the name's.
+The placeholder's span is found by setting aside any of the TOKEN's own
+characters and asking whether the placeholder then stands whole around or through
+the token; a placeholder that characters outside the token have broken is plain
+text with no span, and a token that only abuts one overlaps nothing.
+`compose::token_overlaps_placeholder` (asked by `refresh_completion`, never by
+`complete`) closes the list before any match, offer or rank. And that refresh runs
+after EVERY change to the draft's text or caret, the keys a draft forwards to the
+editor that a reply or fork box gives to the preview (`Home`, `End`, `PgUp`,
+`PgDn`, `Ctrl-T`, `Ctrl-E`, `Ctrl-U`, `Ctrl-D`) included, so an open list is
+always the one for the caret it is picked at, and a pick never writes into a
+placeholder.
+
+- **The map.** `ComposeState::attachments` records what each placeholder stands
+  for (`compose::Attachment`: its kind, path and number; the placeholder itself
+  is derived through the one formatter, never stored). It is scoped to ONE box,
+  like the [model pick](#compose-model-pick-ctrl-l): born empty with every
+  compose and dead with it, nothing global and nothing on disk.
+- **The number.** `N` is the next `App::attachment_number`, monotonic for the
+  `App` and never reset, and that `App` outlives every hand-off. So a placeholder
+  copied out of one box and pasted into another names a number the second box
+  never handed out: it matches none of that box's entries and is sent as the text
+  it is, never as the first box's file. Only a placeholder actually inserted takes
+  a number; a refused path and a dropped result take none. Numbering restarts
+  with a new snapback process, so text copied out of an earlier one can spell a
+  box's OWN placeholder, and then sends that box's own file, which its draft
+  shows.
+- **The expansion.** ONLY `compose::draft()`, the one reader every submit goes
+  through (`submit_compose` and `open_interactive`), turns placeholders into
+  mentions, through the pure `compose::expand_attachments`. It swaps the EXACT
+  placeholder each entry derives, every occurrence, in ONE left-to-right pass that
+  never re-scans what it wrote, and never parses a `[…#N]` shape: text no entry
+  derives stays text, and a file name holding `[` or `]` cannot confuse it. A
+  mention whose preceding character in the OUTPUT is not a
+  [mention boundary](#the-mention-boundary) (a word typed right against the
+  placeholder, `look[Image #1]`) is led by one space; the start of the text is a
+  boundary and gets none, and nothing is added after a mention. An entry whose
+  placeholder has left the text sends nothing.
+- **A hand-edited placeholder** is plain text to claude, as an `@"…"` mention
+  edited out of shape is.
+- **After the send** the message carries the path, not the placeholder: claude's
+  transcript (and so the board's label and claude's own resume list), snapback's
+  `▶ you` echo and a fork's `--name` (`resume::fork_name`) all show it.
+- **The confirmation.** A placeholder names a copied file by its file name alone,
+  so when COPIED FILES attach, by an explicit `Ctrl-V` or by the copied-file
+  upgrade, `compose::confirm_attached` sets a TRANSIENT status naming the absolute
+  path the mention will carry: `attached "<first absolute path>"`, or `attached
+  "<first absolute path>" (+N more)` for several (the pure `compose::attached_status`
+  over the consts `ATTACHED_PREFIX`, `ATTACHED_MORE_OPEN` and `ATTACHED_MORE_CLOSE`).
+  The path is the ESCAPED one, through `compose::shown_path`, the same mechanism
+  the refusal lines use: `Path`'s `Debug`, which quotes the path and escapes it
+  the way Rust's `Debug` escapes a string (Rust 1.95.0, `rust-toolchain.toml`:
+  `library/core/src/char/methods.rs` and `library/core/src/str/lossy.rs`). The
+  path has already passed `file_mention` (the refusal table below). The line
+  dwells `STATUS_DWELL_TICKS` and is an OUTCOME, which the status-line rule allows
+  ([PATTERNS.md §11](PATTERNS.md#11-status-line-ownership)). It NEVER replaces a
+  STICKY status (`App::has_sticky_status`): a refusal set by the same finish, or
+  one already on the line while the read ran, wins, so a `not attached: …` is
+  never overwritten by a confirmation. A screenshot saved to the cache gets none,
+  since its cache path means nothing to the user. It renders on the help row,
+  which shows `App::status` ahead of the compose hint while a box is open. That row
+  cuts at the terminal width, never wraps, so a narrow terminal may cut a long path
+  (and its `(+N more)`), it collapses a run of plain spaces inside the path to
+  one (`render_help` joins the status's words with a single space), and it may
+  further hide characters that draw with zero width. So the path shown can differ
+  from the path the mention carries.
+
+**The mention.** Every attachment reaches claude as `@"<absolute path>"`, written
+by `complete::file_mention` into the message `draft()` sends. Never a bare path: a
+`-p` run has nobody to approve a Read outside the session's folder, while claude's
+own input processing attaches an `@` mention
+([CLAUDE_CLI.md](CLAUDE_CLI.md#file-mentions-reach-claude-bare-paths-do-not)
+holds the evidence). The mention is ordinary text inside the one trailing message
+element, so no argv builder takes part.
+
+`file_mention` refuses every path claude's mention extractor cannot carry, each
+with its own `MentionRefusal` and wording (`MentionRefusal::describe`):
+
+| Refusal | The path | Why |
+| --- | --- | --- |
+| `Relative` | is not absolute | claude resolves a relative mention against its own cwd |
+| `NotUtf8` | is not UTF-8 | it cannot sit in the argv text |
+| `Quote` | contains `"` | it ends the quoted form |
+| `Hash` | contains `#` | claude's `#L<n>` suffix parse truncates the path there |
+| `HiddenMention` | has an `@` right after a [mention boundary](#the-mention-boundary) character: JavaScript's `\s` (U+FEFF included, U+0085 NEL not) or one of `。、？！` | claude's UNQUOTED extractor runs over the same text and would pull a SECOND mention out of this one: still true in 2.1.306, whose scanner is quote-blind (after whitespace in the path; [CLAUDE_CLI.md](CLAUDE_CLI.md#file-mentions-reach-claude-bare-paths-do-not) has the reading) |
+| `Control` | contains a control character | a newline breaks extraction |
+| `AgentSuffix` | ends in ` (agent)` | claude drops a quoted name with that ending |
+
+An `@` glued to a word (`/tmp/a@b.png`) stays allowed. A NEL before an `@` is no
+boundary, so it is refused as `Control` (it is a control character), never as
+`HiddenMention`. On macOS the list step
+turns a CR or LF inside a copied path into U+0001, so such a path arrives whole
+and is refused as `Control` rather than cut short.
+
+A refusal names EVERY refused path, quoted by `Path`'s `Debug`
+(`compose::shown_path`, which the confirmation reuses; two files of one name in
+different folders stay apart, and a newline is escaped rather than breaking the
+line), each with its cause, on ONE sticky line
+(`compose::refusal_status`): `<prefix><path:?> — <cause>[; <path:?> — <cause>]…`.
+
+- **An explicit attach** (`Ctrl-V`, or an empty paste) inserts the accepted
+  placeholders at the caret, and `not attached: …` names every refused path. With
+  every path refused, the draft stays byte-identical, caret included.
+- **A copied-file upgrade** is all or nothing, below.
+
+**The copied-file upgrade (`Cmd+V`).** The terminal owns `Cmd+V`: it can never be
+a binding, so it reaches a compose box only through the paste it produces. A
+copied file pastes as its path or name, and that paste goes in verbatim like any
+other. When it is ONE line of at most `PASTE_FILE_NAMES_MAX_CHARS` (1024)
+characters shaped like a rendering `paste_names_files` (below) matches —
+`compose::paste_may_name_files` — `insert_paste` also asks the clipboard,
+silently. Two shapes ask:
+
+- a PATH rendering, starting with one of `compose::PASTE_PATH_PREFIXES`: `/` (a
+  raw or backslash-escaped absolute path; iTerm2 escapes inside the path, never
+  its leading `/`), `file://`, `'/` or `"/` (a quoted absolute path), or `~/`,
+  which no rendering matches, since the clipboard's paths are absolute, so that
+  read never upgrades;
+- bare file NAMES: no `/` (so no `scheme://` either), and EVERY
+  whitespace-separated word a name whose extension is at most
+  `FILE_EXTENSION_MAX_CHARS` (8) alphanumerics holding at least one letter.
+
+Neither shape asks when the paste names a URI scheme (RFC 3986's
+`[A-Za-z][A-Za-z0-9+.-]*`) other than `file`, the one `paste_names_files`
+matches: a `<scheme>://` ANYWHERE in it, its scheme the whole run before the
+`://` (`/x https://y`, `/x/https://y`, `/a/xfile:///b`;
+`compose::holds_non_file_url`), or a whitespace-separated word OPENING with
+`<scheme>:` (`mailto:a@b.com`, a bare `http:`;
+`compose::opens_with_non_file_scheme`). So a URL, a `mailto:`, a relative `a/b`,
+a version (`v1.2`), a number (`3.14`) and prose stay plain pastes at no read. The
+shape is not exact, and misses both ways, knowingly:
+
+- **Text that still costs a read.** A leading-`/` word such as a slash command
+  (`/compact`), a bare `/`, and a dotted word such as `example.com`, `a@b.com` or
+  `node.js` are shaped like a path or a name, so each costs one silent read and
+  nothing else: the upgrade also needs `paste_names_files`, so the text stays as
+  pasted.
+- **Copied files that never upgrade**, since their paste is never asked about: a
+  names-only rendering of a name holding a space (`my doc.pdf`, which reads as
+  words) or with no extension as above (`Makefile`, `v1.2`), and a path or name
+  holding a `scheme:` word or a `<scheme>://` other than `file`'s
+  (`/tmp/a mailto:b.png`). `Ctrl-V` attaches each.
+
+The ask is an `Upgrade` purpose that snapshots the inserted text, the buffer and
+the caret (skipped, just as silently, while another read is pending). That read is
+`ReadMode::ListOnly`, which answers `Files` or `Nothing` and NEVER saves an image,
+so an ordinary text paste cannot leave a screenshot in the cache. A `Files` result
+replaces the pasted span with placeholders for ALL the clipboard's files only when:
+
+1. `compose::paste_names_files` recognises the paste as one terminal rendering of
+   exactly those files: the first path raw (VS Code / xterm.js paste the first
+   file's path); all paths joined by a space; backslash-escaped paths joined by a
+   space (iTerm2; compared unescaped); single- or double-quoted paths; `file://`
+   URIs, raw or percent-encoded; base names joined by a space (read from the
+   terminals' sources, 2026-10-06, not tested live);
+2. the buffer and the caret still equal the snapshot; and
+3. EVERY one of those files passes `file_mention`.
+
+A non-matching file list, a moved draft or any result but `Files` keeps the paste
+exactly as inserted and says nothing: it was an ordinary paste. A matching list
+that holds a file no mention can carry ALSO keeps the paste exactly as inserted,
+buffer and caret, since swapping in only the accepted placeholders would delete the
+refused files' pasted text, and a sticky `paste kept as text, cannot attach: …`
+names every such file. An image-only clipboard attaches through an EMPTY paste
+instead (VS Code and Cursor send one); iTerm2 and the JetBrains terminals send
+nothing, so `Ctrl-V` is the image key there.
+
+**Known limitation: one line only.** A paste of several files on separate lines
+(a terminal that pastes one path per line) stays text: `paste_may_name_files`
+never asks about a second line, so `paste_names_files` holds no newline-joined
+rendering. `Ctrl-V` attaches those files.
+
+Two risks of the upgrade are known and carry no code change:
+
+- **A forged clipboard (accepted).** Whatever writes the clipboard can make it
+  name the very files a paste names, so a paste can be upgraded to an attachment
+  of a file the user never copied. Accepted, because the draft names the attached
+  file through its placeholder (`[<file name> #N]`, the file name only), the status
+  line names the ESCAPED absolute path of the FIRST copied file at the moment it
+  attaches (the transient `attached …` confirmation above, escaped as the refusal
+  lines escape paths), the full path also goes in the message sent, and nothing is
+  sent until the user sends it (`Enter`, or a fork's or draft's `Ctrl-O`). That
+  line is a weaker safeguard than a full listing: it is cut at the terminal
+  width, it may further hide characters that draw with zero width, and it joins
+  a run of plain spaces to one (the confirmation above), the other files are only
+  COUNTED (`(+N more)`), so for several files it names the first alone, and it
+  does not show at all while a STICKY status holds the line (a refusal, a
+  failure, or one of the deliberately sticky confirmations
+  `App::has_sticky_status` names). The placeholder and the unsent draft are what
+  the risk rests on beyond it.
+- **macOS's pasteboard-privacy alert (an OPEN, UNVERIFIED risk).** The silent
+  check reads the pasteboard (`osascript`) after a paste of one of the shapes
+  above, a read the user never asked for, and macOS may answer such a read with
+  its pasteboard-access alert. Nobody has checked either way. The manual check
+  that settles it: on macOS 15.4 or later (macOS 26 and later included), in a
+  compose box, paste a one-line path such as `/tmp/x.png` copied as TEXT, and
+  watch for a system prompt asking whether the terminal or `osascript` may read
+  the pasteboard. A prompt there means the silent check needs rethinking; none
+  means the risk is closed, and this entry goes.
+
+**`Ctrl-V` against the editor and the terminal.** The key shadows
+`ratatui-textarea`'s `Ctrl-V` page-down on purpose: a draft keeps `PgDn` for its
+editor, and a reply's or fork's `PgDn` scrolls the preview
+([PATTERNS.md §10](PATTERNS.md#10-keys-actions-outcomes) owns the key rule). A
+terminal that binds `Ctrl-V` as its own paste never delivers it; the empty paste
+and the copied-file upgrade still reach the attach there.
+
+#### The mention boundary
+
+`complete::is_mention_boundary(c)` is the ONE predicate for what may stand right
+before the `@` of a mention claude's extractors read: JavaScript's `\s` (U+0009 to
+U+000D, U+0020, U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F,
+U+3000 and U+FEFF) plus `。`, `、`, `？` and `！`. It is spelled out because Rust's
+`char::is_whitespace` differs both ways: it takes U+0085 (NEL), which claude reads
+as plain text, and lacks U+FEFF, which claude reads as a boundary. The start of
+the text is a boundary too, and each caller decides it, since the predicate takes
+a `char`. Provenance: read from the claude bundles, 2.1.289 (2026-10-06) and
+2.1.306 (2026-10-22), where the quoted extractor carries this same boundary class
+([CLAUDE_CLI.md](CLAUDE_CLI.md#file-mentions-reach-claude-bare-paths-do-not) has
+the readings). Three decisions ask it, and no
+other rule restates the set: `file_mention`'s refusal of a hidden second mention
+(`MentionRefusal::HiddenMention`), `mention_insert_text`'s leading space at the
+caret, and `compose::expand_attachments`'s leading space before an expanded
+mention. So a caret right after `。`, `、`, `？`, `！` or a BOM gets no leading
+space, and one right after a NEL does. A question about the text AFTER the caret,
+or about where a pick-list token ends (`complete::completion_context`), is a
+different one and keeps its own rule.
+
+#### Reading the clipboard (`tui::clipboard`)
+
+The read reuses the copy's `ClipboardEnv` facts and adds no crate: the tools are
+plain `std::process` children. The route (`clipboard_read_route`, pure): SSH on
+any OS → `RemoteSession`; macOS → `osascript`; Linux with a Wayland display →
+`wl-paste`; Linux with only X11 → `xclip`; anything else → `NoDisplay`. `xsel`
+stays copy-only, because it cannot read non-text targets. Unlike the copy there
+is no OSC 52 fallback: reading the clipboard back through the terminal is a query,
+which TERMINAL SAFETY forbids.
+
+A read runs a LIST step; on Linux, only when the list offers `text/uri-list`, a
+FILES step; and, for an image in `ReadMode::Attach` only, an IMAGE step. Every
+argv is a named const, pinned by `each_read_step_carries_its_pinned_argv` (each
+script body against a literal of its own, never against its const), where
+`{type}` is the slot for the chosen type and `{dest}` for the file a macOS image
+step writes; a type or a path travels as an argument, never spliced into script
+text:
+
+| Backend | List | Files | Image | Empty-clipboard exit |
+| --- | --- | --- | --- | --- |
+| `osascript` (macOS) | `MACOS_LIST`: `osascript -l JavaScript -e <MACOS_LIST_SCRIPT>`, JXA over `NSPasteboard` printing `T\t<type>` and `F\t<path>` lines (the named `MACOS_TYPE_TAG` and `MACOS_FILE_TAG` the parser strips, held to the script's own spelling by `the_macos_list_script_pushes_exactly_the_parsers_tags`) — every copied file at once, where AppleScript's `«class furl»` returns only the first | in the list | `MACOS_PNG_IMAGE`: `osascript -e 'on run argv' … -e 'set png_data to (the clipboard as «class PNGf»)' … {dest}`, the AppleScript `claude 2.1.289` ships, for a PNG, JPEG or TIFF; `MACOS_RAW_IMAGE`: `osascript -l JavaScript -e <MACOS_RAW_IMAGE_SCRIPT> {type} {dest}`, the pasteboard's raw bytes, for a GIF or WebP (checked on macOS 27.0.1, 2026-10-11) | none: an empty pasteboard lists nothing and exits 0 |
+| `wl-paste` (Wayland) | `WL_PASTE_LIST`: `wl-paste --list-types` | `WL_PASTE_URI_LIST`: `wl-paste --no-newline --type text/uri-list` | `WL_PASTE_IMAGE`: `wl-paste --type {type}`, the bytes on stdout | `1` (`WL_PASTE_NOTHING_COPIED_EXIT`, wl-clipboard 2.3.0) |
+| `xclip` (X11) | `XCLIP_LIST`: `xclip -selection clipboard -t TARGETS -o` | `XCLIP_URI_LIST`: `xclip -selection clipboard -t text/uri-list -o` | `XCLIP_IMAGE`: `xclip -selection clipboard -t {type} -o`, the bytes on stdout | `1` (`XCLIP_NO_OWNER_EXIT`, xclip 0.13) |
+
+**The list step's exit is classified per backend** (`classify_list_exit(kind,
+code)`, pure and table-tested): exit 0 is the listing; `wl-paste`'s or `xclip`'s
+exit 1 is an EMPTY clipboard (`Nothing`); any other code, ANY non-zero `osascript`
+exit, and a signal are `Failed`. Exit 1 is also what those two tools' other early
+failures exit with (no compositor, no display), so those read as empty too.
+
+**Fail-soft over the tools' output.** The listing parsers skip any line they do
+not recognise; a `text/uri-list` (RFC 2483) keeps only `file://` URIs (an empty
+host or `localhost`: `clipboard::FILE_URI_SCHEME`, `FILE_URI_LOCAL_HOST`),
+percent-decoded, and skips comments, any URI with a malformed escape (a `%` not
+followed by exactly two hex digits, `%+5` or a lone `%` say: refused rather than
+kept literal, since a guess could name a different file than the one copied) and
+any URI that decodes to non-UTF-8 (`clipboard::percent_decode`); a FILES step
+that fails is no files, so the read falls through to an image or to text. The
+direction is
+[PATTERNS.md §1](PATTERNS.md#1-fail-soft-over-external-input)'s.
+
+**Every child is bounded** (`clipboard::run_capture`): stdin and stderr null and
+stdout piped, so it never sees the TTY; a process group of its own; past
+`CLIPBOARD_READ_TIMEOUT` (10 s) the whole group and the child are killed before
+the reap; the wait for its stdout reader is bounded by `READ_STDOUT_GRACE`
+(500 ms) and its expiry is `Failed`; and its output is capped (`LIST_MAX_BYTES`,
+1 MiB, for a listing; `PASTE_IMAGE_MAX_BYTES` for an image). The thread shape and
+the kill are [PATTERNS.md §6](PATTERNS.md#6-off-ui-thread-for-anything-that-can-block)'s.
+
+#### The paste cache
+
+A pasted image is written ATOMICALLY — under the temp name
+`.paste-<pid>-<nanos>.<ext>.tmp`, then renamed to `paste-<pid>-<nanos>.<ext>` —
+in `config::paste_cache_dir()`: `<config>/cache/paste`, by default
+`~/.config/snapback/cache/paste/`. Before ANYTHING is written — the directory,
+the temp file, the image — the final path is made absolute (a relative config
+dir is resolved) and run through `complete::file_mention`: an image saved and
+then refused would sit in the cache for the whole TTL, and every retry would add
+another. A refused path writes nothing and comes back as `Unmentionable`, named
+with its cause like a refused copied file. The directory is created on demand,
+owner-only on unix (`PASTE_DIR_MODE`, `0700`), because a screenshot can carry
+secrets. An empty, over-cap or failed write is removed, never renamed.
+
+It is prunable CACHE, never read back, so the per-session state map
+(`sessions.json`) stays snapback's only persistent state, with this cache beside
+it ([above](#snapback-owned-state-srchiddenrs)): claude embeds an
+attached file's content at send time, so an image only has to outlive a draft left
+open and a `--bg` worker's first read. ONE prune, `clipboard::prune_expired` under
+`PASTE_CACHE_TTL` (7 days), runs from two places: the read worker, before each
+image write, and `clipboard::spawn_paste_cache_prune`, a detached thread
+`tui::run_inner` starts at every board start — launch and every return from a
+`claude` child — so a screenshot cannot outlive the TTL for want of a later
+paste. That thread reports no event. The prune deletes only regular files
+DIRECTLY in the directory whose names `is_paste_cache_name` accepts (`paste-…`,
+or the `.paste-…` temp form a crash may leave) and whose mtime is past the TTL; it
+never recurses, never follows a symlink, and skips a missing or unreadable
+directory or entry. Nothing is deleted after a send, and a file attached by
+copying it is referenced in place and never touched. The one delete of a SAVED
+image besides the prune is a dropped `Image` result's own file, as soon as it
+lands ("Stale tokens" in [Compose attach](#compose-attach-ctrl-v)).
+
 ### Terminal paste routing (`Event::Paste`)
 
 `tui::init_terminal` enables **bracketed paste**, so the terminal delivers a
@@ -3820,8 +4274,10 @@ open) — a partial enumeration here is a wrong one, so all seven are stated:
 | **`Ctrl-X` chord** (`handle_chord_key`) | ignored, chord stays ARMED | The chord resolves on exactly one KEY, hit or miss. A paste carries no completion, and cancelling on one would silently disarm a chord whose hint is still on screen. |
 | **Stop confirm** (`handle_stop_confirm_key`) | ignored | A plain Enter/Esc gate; a paste is neither, and must never stop an agent. |
 | **Interrupt confirm** (`handle_interrupt_confirm_key`) | ignored | Same. |
-| **Compose** (`App::is_composing`) | inserted at the caret, newlines intact (`compose::insert_paste` → `TextArea::insert_str`), then the [pick list](#compose-pick-list) re-derived, so a pasted `/` or `@` opens it like a typed one | The fix: as keystrokes, the first embedded newline was a bare `Enter` = `ComposeAction::Send`. |
-| **Board** | inserted at the query's caret — at the [find bar](#find-bar-ctrl-f)'s while it is open — newlines flattened to spaces | The query is one line and `search::gate_atoms` splits it on spaces into substring atoms, so `foo\nbar` becomes exactly the `foo bar` the user could have typed. First-line-only would silently discard input. |
+| **Compose** (`App::is_composing`) | the status line cleared first, as a key and a board paste do (`App::clear_status`), then inserted at the caret, newlines intact (`compose::insert_paste` → `TextArea::insert_str`), then the [pick list](#compose-pick-list) re-derived, so a pasted `/` or `@` opens it like a typed one | The fix: as keystrokes, the first embedded newline was a bare `Enter` = `ComposeAction::Send`. |
+| ↳ **Compose**, an EMPTY paste — in the `Ctrl-R` reply, the `Ctrl-X f` fork and the `Ctrl-N` draft alike | the status line cleared first, then an `Explicit` [attach](#compose-attach-ctrl-v), exactly as `Ctrl-V` (`compose::request_attach`, nudging while a read is pending, and holding `Enter` and a fork's or draft's `Ctrl-O` while its own read is); nothing is inserted | `Cmd+V` of an image-only clipboard: VS Code and Cursor send an empty paste for it, and `Cmd+V` can never be a binding, so this is how it reaches the attach. |
+| ↳ **Compose**, a one-line paste shaped like a copied file's rendering — a path rendering or bare file names (`compose::paste_may_name_files`, [attach](#compose-attach-ctrl-v)) — in all three boxes alike | inserted verbatim as above, then the silent copied-file `Upgrade` check: replaced by a placeholder for each of the clipboard's files only when the clipboard confirms those very files, the draft has not moved, and every file can be mentioned; a file that cannot keeps the paste as text under a sticky refusal naming it ([attach](#compose-attach-ctrl-v)). The check never holds `Enter` or `Ctrl-O` | `Cmd+V` of copied files: a terminal pastes their path or name as text, which only the clipboard can confirm. |
+| **Board** | inserted at the query's caret — at the [find bar](#find-bar-ctrl-f)'s while it is open — newlines flattened to spaces; an EMPTY paste does nothing | The query is one line and `search::gate_atoms` splits it on spaces into substring atoms, so `foo\nbar` becomes exactly the `foo bar` the user could have typed. First-line-only would silently discard input. |
 
 Two rules hold on every path, both in `update::accept_paste`: line endings
 normalize to `\n` (`\r\n` collapses to one, a lone `\r` becomes one), and the text
@@ -3834,7 +4290,16 @@ argued at `view::render_search`); a compose draft takes at
 most `send::COMPOSE_PROMPT_MAX_BYTES` **bytes**, the limit below. Over-long pastes
 **truncate** rather than being rejected — the head still lands — and say so on the
 status line in the unit that applied ("kept the first N characters" / "kept the
-first N bytes"), so it is never silent.
+first N bytes"), so it is never silent. The
+truncation status is set AFTER the clear below, so it survives it.
+
+A paste that inserts, on the compose and board arms alike, and an EMPTY paste a
+compose box turns into the attach request, clear the status line BEFORE they act
+(`handle_paste`, one call), exactly as an actionable keypress does: a stale sticky
+refusal does not outlive it, and does not hide the copied-file
+[confirmation](#compose-attach-ctrl-v) the same paste's upgrade or the empty
+paste's read may set. A swallowed paste (the five overlay owners) and an empty
+paste on the board clear nothing.
 
 The compose limit exists because the draft becomes ONE argv element of the `claude`
 child on every launch path (`build_send_argv`, `build_fork_send_argv`,
@@ -3847,8 +4312,12 @@ and a `node:24-alpine` arm64 container). A paste is cut at it, but several paste
 or typing can still pass it, so the SEND is checked too. `compose::submit_compose`
 (`Enter`, in ALL THREE boxes) and `compose::open_interactive` (`Ctrl-O`, in the fork
 box and the draft; the reply's `Ctrl-O` is inert and checks nothing) call
-`send::check_prompt_len` on the whole draft before any target routes, and a draft
-over the limit is refused with a STICKY status naming its size and the limit in
+`send::check_prompt_len` on the whole draft as it will be SENT, each attachment
+placeholder already expanded into its `@"<absolute path>"` mention (`compose::draft`,
+[attach](#compose-attach-ctrl-v)), so a short placeholder over a long folder counts
+as the mention that becomes the argument; this is asked before any target routes
+and after a box's wait for its own attachment read, and a draft over the limit is
+refused with a STICKY status naming its size and the limit in
 bytes, the box left open with the draft intact, nothing sent, forked or launched,
 no fork jump armed and no agent recorded (`last_new_agent`). The status is one row
 cut at 80 columns, so `send::prompt_too_long_refusal` keeps its widest form
@@ -3863,9 +4332,17 @@ the wrong rows with the caret off screen, and a debug build can panic in the
 render loop. A known, accepted limit, argued at `view::render_compose_zone`.
 
 `handle_paste` returns no `Outcome`. A paste is DATA and structurally cannot send,
-resume, launch, or quit. There is deliberately **no `Ctrl-V` binding**: the paste
-is the terminal's own, which keeps working over SSH and inside tmux where an
-app-side clipboard read would not, and `Ctrl-V` stays the editor's page-down.
+resume, launch, or quit. It has ONE exception to staying the text that was
+pasted: the copied-file upgrade above, where the clipboard confirms it holds the
+very files the paste names and the silent read replaces the pasted text with
+their attachment placeholders — still text in the draft, and still no submit.
+(An EMPTY paste carries no text at all; it is the `Ctrl-V` request.) TEXT paste stays the
+terminal's own, which keeps working over SSH and inside tmux where an app-side
+clipboard read would not, so snapback binds no key to paste text. `Ctrl-V` is
+bound ONLY inside a compose box, as the [ATTACH key](#compose-attach-ctrl-v) for
+what a paste cannot carry — copied files and images, which snapback reads from
+the OS clipboard itself and refuses over SSH; on the board and in every modal it
+stays unbound.
 
 ## Hand-off invocations (`src/resume.rs`)
 
@@ -3973,8 +4450,8 @@ the session's folder and transcript (`compose::completion_source`).
 
 | Key | Route |
 | --- | --- |
-| `Enter` | headless, over the reply's send path (`compose::submit_fork_with`). A message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused FIRST, before any other step (`compose::submit_compose` → `send::check_prompt_len`: a sticky status naming its size and the limit, the box and its text kept, nothing dispatched, no jump armed). An empty message nudges (`COMPOSE_EMPTY_FORK_HINT`, transient) and keeps the box. Otherwise: re-read the original's authoritative `(cwd, id)` (`send::plan_send`), take ONE fresh id (`send::fresh_session_id`, 16 bytes of `/dev/urandom` through the pure `format_uuid_v4`; a failed read refuses with a sticky status, keeps the box and its text, and dispatches nothing), build `send::build_fork_send_argv`, mark the send in flight under the NEW id, arm the cursor jump, and hand the driver a `SendRequest` keyed by that id. Completion is the reply's `SendFinished`, with its `sent — $…` wording. |
-| `Ctrl-O` | interactive hand-off, `SessionAction::ForkRun` (`update::launch_fork_run` → `resume::check_fork_run`: the same authoritative re-read, no race probe, and a non-zero exit says `MODEL_NONZERO_HINT` when `--model` is really emitted (a carried `--effort` alone does not count), else `FORK_NONZERO_HINT` — never the resume hint, which would send the user back to `Ctrl-X f`). A message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused first, with `Enter`'s same sticky status and the box kept (`compose::open_interactive`, before the hand-off is built). A session gone from the board refuses with `COMPOSE_FORK_SESSION_GONE`. A typed message rides as the trailing positional. No cursor jump. |
+| `Enter` | headless, over the reply's send path (`compose::submit_fork_with`). While the box's own `Ctrl-V` (or empty-paste) read is pending it forks nothing, FIRST: a transient nudge (`compose::ENTER_WHILE_ATTACHING_HINT`), box, text and read untouched ([attach](#compose-attach-ctrl-v)). Then a message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused, before any other step (`compose::submit_compose` → `send::check_prompt_len`: a sticky status naming its size and the limit, the box and its text kept, nothing dispatched, no jump armed). An empty message nudges (`COMPOSE_EMPTY_FORK_HINT`, transient) and keeps the box. Otherwise: re-read the original's authoritative `(cwd, id)` (`send::plan_send`), take ONE fresh id (`send::fresh_session_id`, 16 bytes of `/dev/urandom` through the pure `format_uuid_v4`; a failed read refuses with a sticky status, keeps the box and its text, and dispatches nothing), build `send::build_fork_send_argv`, mark the send in flight under the NEW id, arm the cursor jump, and hand the driver a `SendRequest` keyed by that id. Completion is the reply's `SendFinished`, with its `sent — $…` wording. |
+| `Ctrl-O` | interactive hand-off, `SessionAction::ForkRun`. While the box's own `Ctrl-V` (or empty-paste) read is pending it hands off nothing, FIRST: a transient nudge (`compose::CTRL_O_WHILE_ATTACHING_HINT`), box, text and read untouched ([attach](#compose-attach-ctrl-v)). Otherwise (`update::launch_fork_run` → `resume::check_fork_run`: the same authoritative re-read, no race probe, and a non-zero exit says `MODEL_NONZERO_HINT` when `--model` is really emitted (a carried `--effort` alone does not count), else `FORK_NONZERO_HINT` — never the resume hint, which would send the user back to `Ctrl-X f`). A message over `send::COMPOSE_PROMPT_MAX_BYTES` is refused next, with `Enter`'s same sticky status and the box kept (`compose::open_interactive`, before the hand-off is built). A session gone from the board refuses with `COMPOSE_FORK_SESSION_GONE`. A typed message rides as the trailing positional. No cursor jump. |
 
 Both argvs, and what claude 2.1.291 was checked and probed for (both forms, the
 `Ctrl-O` message's auto-submit included), are
@@ -4035,12 +4512,14 @@ launching, and from there:
 
 | Key | argv | Route |
 | --- | --- | --- |
-| `Enter` (pick list closed) | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. Refused first, with the box kept, for a draft over `send::COMPOSE_PROMPT_MAX_BYTES` or an empty one. |
+| `Enter` (pick list closed) | `claude [--agent <name>] [--model <alias> [--effort <level>]] --bg <prompt>` | `Outcome::BgLaunch` → `send::spawn_bg_launch` → one `AppEvent::BgLaunchFinished`. **No teardown** — the board stays up. While the draft's own `Ctrl-V` (or empty-paste) read is pending it launches nothing, FIRST: a transient nudge (`compose::ENTER_WHILE_ATTACHING_HINT`), draft and read untouched ([attach](#compose-attach-ctrl-v)). Then refused, with the box kept, for a draft over `send::COMPOSE_PROMPT_MAX_BYTES` or an empty one. |
 | `Enter` / `Tab` (pick list OPEN) | none | `ComposeAction::AcceptCompletion`: picks the highlighted row into the draft → `Outcome::Continue`. Launches nothing ([compose pick list](#compose-pick-list)). |
-| `Ctrl-O` | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. Refused first, with the box kept, for a draft over `send::COMPOSE_PROMPT_MAX_BYTES`; an empty one is fine. |
+| `Ctrl-O` | `claude [--agent <name>] [--model <alias> [--effort <level>]] [<prompt>]` | `Outcome::Resume` → the ordinary teardown round trip, via `resume::check_new`. While the draft's own `Ctrl-V` (or empty-paste) read is pending it hands off nothing, FIRST: a transient nudge (`compose::CTRL_O_WHILE_ATTACHING_HINT`), draft and read untouched ([attach](#compose-attach-ctrl-v)). Then refused, with the box kept, for a draft over `send::COMPOSE_PROMPT_MAX_BYTES`; an empty one is fine. |
 
 `Esc` with the pick list open closes only the list (`ComposeAction::CloseCompletion`);
-with it closed, `Esc` cancels the draft and its card together.
+with it closed, `Esc` cancels the draft's own explicit read while one is pending,
+keeping the draft ([attach](#compose-attach-ctrl-v)), and otherwise cancels the
+draft and its card together.
 
 `Enter` therefore lives in the [`send`](#quick-reply--non-interactive-send-srcsendrs)
 family, not the hand-off one: `--bg` registers the agent and returns immediately
@@ -4049,7 +4528,7 @@ refuses `Enter` (a background agent with no prompt does nothing) but is fine for
 `Ctrl-O`, which then launches with no positional — with no pick, exactly what the
 picker's own `Ctrl-O` emits. A draft too long to be one `claude` argument
 (`send::COMPOSE_PROMPT_MAX_BYTES`, [paste routing](#terminal-paste-routing-eventpaste))
-refuses BOTH keys, before either does anything else. Both routes carry the draft's own `Ctrl-L` pick when
+refuses BOTH keys, once any attach wait is over and before either does anything else. Both routes carry the draft's own `Ctrl-L` pick when
 it has one, and only then ([compose model pick](#compose-model-pick-ctrl-l)): the
 draft chose its model, and which key starts it does not change that.
 

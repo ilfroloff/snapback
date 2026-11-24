@@ -32,7 +32,7 @@ use crossterm::terminal::{
 use ratatui::DefaultTerminal;
 
 use crate::store::SessionStore;
-use crate::watch::{AppEvent, CopyPayload, EventLoop, Waited};
+use crate::watch::{AppEvent, ClipboardAttach, CopyPayload, EventLoop, Waited};
 
 pub use app::{App, Scope};
 pub use update::Outcome;
@@ -550,6 +550,17 @@ fn run_inner(
     // as the default inside the session that just ended reaches the next draft.
     // Untested for the same accepted reason as the line above.
     events.spawn_settings_model_probe(app.launch_dir.clone());
+    // Prune the `Ctrl-V` paste cache of files past their TTL, on a detached thread
+    // of its own, so a pasted screenshot does not outlive the TTL just because no
+    // later image write came to prune it. Fire-and-forget: it delivers no
+    // `AppEvent` and nothing waits on it; dropping the handle detaches it. Once per
+    // board session like the probes above, so a board left up across many `claude`
+    // round trips keeps pruning. Untested for the same accepted reason; the thread
+    // is pinned through `clipboard::spawn_paste_cache_prune`'s own tests. The real
+    // directory is named ONCE, here, for both of the cache's deleters: this prune
+    // and the stale-image discard in the loop below (PATTERNS §6's seams).
+    let paste_cache_dir = crate::config::paste_cache_dir();
+    drop(clipboard::spawn_paste_cache_prune(paste_cache_dir.clone()));
     // The app's queue of completions no board session has read. It outlives this
     // session because `lib::run` re-enters the board on the SAME `App`, while the
     // channel above dies with this function.
@@ -672,6 +683,33 @@ fn run_inner(
         if let Some(cwd) = compose::take_catalog_fetch(app) {
             crate::claude_catalog::spawn_fetch(cwd, events.sender());
         }
+        // A compose that asked to attach the clipboard (`Ctrl-V`, an empty paste, a
+        // file-shaped paste) gets its read started here, OFF the UI thread: the
+        // ONE `AppEvent::ClipboardRead` comes back on this channel. The decision is
+        // `compose::take_clipboard_read`'s; no key handler spawns.
+        if let Some((token, mode)) = compose::take_clipboard_read(app) {
+            start_clipboard_read(
+                clipboard::clipboard_read_route(clipboard::ClipboardEnv::from_env()),
+                token,
+                mode,
+                events.sender(),
+            );
+        }
+        // A read whose result `finish_attach` dropped (`Esc` cancelled it, or its
+        // compose is gone) left its saved image in the paste cache, attached to
+        // no draft: delete it OFF the UI thread, on a detached thread of its own.
+        // Fire-and-forget like the board-start prune: it delivers no `AppEvent`,
+        // nothing waits on it, and dropping the handle detaches it. The decision
+        // is `compose::take_stale_paste_images`'s; this spawn LINE is untested for
+        // the prune's accepted reason, and the thread is pinned through
+        // `clipboard::spawn_paste_image_discard`'s own tests.
+        let stale_images = compose::take_stale_paste_images(app);
+        if !stale_images.is_empty() {
+            drop(clipboard::spawn_paste_image_discard(
+                stale_images,
+                paste_cache_dir.clone(),
+            ));
+        }
         // Pay out the autoscroll a held drag owes by now, before the next draw.
         // After EVERY wake-up, an event as well as the deadline: moving the mouse
         // past the edge wakes the loop before the deadline, so a step taken only
@@ -725,9 +763,60 @@ fn start_copy<W: Write>(
     }
 }
 
+/// Start the clipboard read `route` picked for `token`: a worker for a real tool,
+/// or, with nowhere to read (SSH, no display), the refusal delivered at once on
+/// `tx` so it travels the same update path as a worker's result. Never reads here.
+fn start_clipboard_read(
+    route: clipboard::ReadRoute,
+    token: u64,
+    mode: clipboard::ReadMode,
+    tx: Sender<AppEvent>,
+) {
+    let refusal = match route {
+        clipboard::ReadRoute::RemoteSession => ClipboardAttach::RemoteSession,
+        clipboard::ReadRoute::NoDisplay => ClipboardAttach::NoDisplay,
+        clipboard::ReadRoute::Backend(kind) => {
+            clipboard::spawn_clipboard_read(
+                kind.backend(),
+                crate::config::paste_cache_dir(),
+                token,
+                mode,
+                tx,
+            );
+            return;
+        }
+    };
+    // A failed send means the board went away.
+    let _ = tx.send(AppEvent::ClipboardRead {
+        token,
+        result: refusal,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SSH and no-display routes deliver their refusal at once, spawning nothing.
+    #[test]
+    fn a_route_with_no_tool_delivers_its_refusal_without_spawning() {
+        for (route, want) in [
+            (
+                clipboard::ReadRoute::RemoteSession,
+                ClipboardAttach::RemoteSession,
+            ),
+            (clipboard::ReadRoute::NoDisplay, ClipboardAttach::NoDisplay),
+        ] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            start_clipboard_read(route, 7, clipboard::ReadMode::Attach, tx);
+            match rx.try_recv() {
+                Ok(AppEvent::ClipboardRead { token, result }) => {
+                    assert_eq!((token, result), (7, want));
+                }
+                other => panic!("expected an immediate ClipboardRead, got {other:?}"),
+            }
+        }
+    }
 
     /// Task VERIFY-4: the teardown sequence must include `DisableMouseCapture`,
     /// so a spawned `claude` / a clean quit / an error exit all leave mouse mode

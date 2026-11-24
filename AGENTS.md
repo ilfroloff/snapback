@@ -42,6 +42,9 @@ one place.
   transcript tail the background refresh cannot read or parse reads as a run
   that has not ended, and a head with no readable timestamp as an unknown launch
   time.
+  Same for the OS clipboard tools' output the compose attach reads, whose
+  direction is ATTACH NOTHING: an unusable listing or image leaves the draft as
+  it was.
   A `claude agents --json` probe that cannot answer
   reads as "not live" everywhere but the `Ctrl-X w` move, which REFUSES
   ([PATTERNS.md §1](docs/agents/PATTERNS.md#1-fail-soft-over-external-input)).
@@ -50,7 +53,7 @@ one place.
   ([DOMAIN.md](docs/agents/DOMAIN.md#records-that-name-a-gone-process)).
   (`src/store/*`, `src/agents.rs`, `src/claude_catalog.rs`,
   `src/claude_move.rs`, `src/command_kinds.rs`, `src/defined_agents.rs`,
-  `src/claude_settings.rs`, `src/claude_trust.rs`)
+  `src/claude_settings.rs`, `src/claude_trust.rs`, `src/tui/clipboard.rs`)
 - **AUTHORITATIVE-FROM-FILE.** Read `cwd`/`sessionId` from INSIDE the file,
   never decode the `<encoded-cwd>` folder name (the `/`→`-` encoding is lossy).
   Re-read them at hand-off time. A `relocated` record (written by claude's `/cd`
@@ -119,10 +122,15 @@ one place.
   in-memory set whole (two windows' snapshots overwrite each other), NEVER
   decide a hide's direction from the re-read, and NEVER overwrite what the save
   could not read — it fails to a status instead. Hiding is a VISIBILITY
-  preference, not a status flag. Mechanism and migration:
+  preference, not a status flag. Beside `state/`, the compose attach's saved
+  clipboard images are prunable CACHE, never state and never read back:
+  `config::paste_cache_dir()` (`cache/paste/`), the dir owner-only (`0700`), each
+  image written atomically, and every cached file past `PASTE_CACHE_TTL` (7 days)
+  pruned before each image write AND at every board start, on a detached thread.
+  Mechanism and migration:
   [DOMAIN.md](docs/agents/DOMAIN.md#snapback-owned-state-srchiddenrs).
   (`src/config.rs`; `src/hidden.rs`; the persist and reload paths in
-  `src/tui/app.rs`)
+  `src/tui/app.rs`; `src/tui/clipboard.rs`)
 - **A MODEL IS PICKED PER COMPOSE, NEVER PER BOARD.** `--model` reaches `claude`
   ONLY from an explicit `Ctrl-L` pick inside a compose box, and only on that
   compose's own launch: the `Ctrl-R` quick reply, the `Ctrl-X f` fork box's
@@ -329,11 +337,14 @@ one place.
   pick list's catalog fetch (`CatalogFetched` — a `claude` child the DRIVER
   starts when the pure `take_catalog_fetch` says so, never a key handler; its
   workspace-trust read and its `command_kinds` folder reads run on that same
-  worker thread, never on a key or the render path) and the `Ctrl-X w` move (`MoveFinished` — its re-read, liveness
+  worker thread, never on a key or the render path), the `Ctrl-X w` move (`MoveFinished` — its re-read, liveness
   probe, trust read and `claude` child all run on the move's own worker, so that
   probe is not the hand-off exception above; a lineage job runs every member's,
   strictly one after another on that ONE worker, each probe right before its own
-  child, never hoisted to one per set) are all that shape, and so is the
+  child, never hoisted to one per set) and the compose attach's clipboard read
+  (`ClipboardRead` — its tool children all run on its worker, which the DRIVER
+  starts when the pure `take_clipboard_read` says so, never a key handler) are
+  all that shape, and so is the
   selected session's RECURRING subagent refresh (`SubagentRuns`, one per request
   it reads): ONE long-lived worker per board session, ended by dropping its
   handle, on which the newest request replaces any it has not started. The
@@ -344,7 +355,11 @@ one place.
   record, and the tail only of those that can be running — written within
   `RUNNING_WINDOW`, themselves or through a subagent below them.
   `Ctrl-X ↓`, `←`/`→`, `↑`/`↓` and the running list read no file: they ask the record it
-  landed.
+  landed. The paste cache's two deleters are a shape of their own, and not an
+  exception either: the board-start prune (`spawn_paste_cache_prune`) and the
+  stale-image discard (`spawn_paste_image_discard`, a dropped read's saved image)
+  are fire-and-forget detached threads that report NOTHING, started by the
+  driver and never on a key or the UI thread.
   (`src/watch.rs`, `src/worktrees.rs`, `src/tui/clipboard.rs`,
   `src/claude_catalog.rs`, `src/claude_trust.rs`, `src/command_kinds.rs`,
   `src/claude_move.rs`, `src/store/subagents.rs`)
@@ -387,8 +402,8 @@ one place.
   and NEVER enumerate routing: touch them only when a key change renames or
   removes one of those core keys, or changes what one of them does, or renames
   or removes one of the flags the README's quick start shows (`-p`, `-a`). A key
-  every compose box shares (`Ctrl-L`, `/` or `@`) is ONE shared "in a compose
-  box" entry in each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` —
+  every compose box shares (`Ctrl-L`, `Ctrl-V`, `/` or `@`) is ONE shared "in a
+  compose box" entry in each key map — the `update.rs` table, `KEYS`, `docs/GUIDE.md` —
   that the `Ctrl-R`, `Ctrl-X f` and `Ctrl-N` entries point to, never copies.
   The help line is ONE row, cut rather than wrapped. The board keymap FITS BY
   DROPPING (`view::help_row`): whole entries leave from the end of a priority
@@ -489,7 +504,7 @@ Full command reference and the validation checklist:
 | Session format, JSONL fields, domain concepts | [docs/agents/DOMAIN.md](docs/agents/DOMAIN.md) |
 | Implementation + testing conventions | [docs/agents/PATTERNS.md](docs/agents/PATTERNS.md) |
 | Commands, env, `--print-list`, CI + release automation, checklist | [docs/agents/OPERATIONS.md](docs/agents/OPERATIONS.md) |
-| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on, the `initialize` handshake the pick list asks, the `set_cwd` request the `Ctrl-X w` move sends, the workspace-trust rule that picks their argv and environment, the website gap claims (the evidence behind each website feature row) | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
+| External `claude` CLI flags/commands + version pin + spawned argv, the `--model` alias capture, the model a launch without `--model` runs on, the `initialize` handshake the pick list asks, the `set_cwd` request the `Ctrl-X w` move sends, the workspace-trust rule that picks their argv and environment, why the compose attach writes `@"<path>"` mentions, the website gap claims (the evidence behind each website feature row) | [docs/agents/CLAUDE_CLI.md](docs/agents/CLAUDE_CLI.md) |
 | Commit message rules + examples | [GIT_COMMIT_INSTRUCTIONS.md](GIT_COMMIT_INSTRUCTIONS.md) |
 | Reading order / doc ownership | [docs/agents/README.md](docs/agents/README.md) |
 | End-user features + full key map | [docs/GUIDE.md](docs/GUIDE.md) |

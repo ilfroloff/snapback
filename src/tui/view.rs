@@ -2301,21 +2301,23 @@ const REPLY_COOKING_LABEL: &str = "cooking\u{2026}";
 /// instead ([`draft_hint`]).
 ///
 /// It deliberately does NOT carry the reply arm's scroll clause (`PgUp/PgDn
-/// scroll`): a draft shows no transcript, so those keys stay the editor's there. This string is 112 columns, so on the
+/// scroll`): a draft shows no transcript, so those keys stay the editor's there. This string is 128 columns, so on the
 /// one-line help row the clause would be painted past the end of an 80-column
 /// terminal, and on the draft card — which wraps rather than clipping — it would
 /// cost a further wrapped row of a placeholder whose whole point is to stay
 /// near-empty.
 ///
-/// `Ctrl-L model` (this draft's model picker) is the one key that DID earn a place,
-/// and it sits right after `Ctrl-O run interactively` — ending at column 67 — so it
-/// is inside the 80 columns the help row draws, where the newline clause and
-/// `Esc cancel` behind it already were not. On the card its 15 columns (97 before
-/// it, 112 with it) can cost one more wrapped row on a narrow pane: the card wraps
-/// where the help row is cut, and that row is the price of the card sharing this
-/// const, which is what keeps the two surfaces from naming different keys.
+/// `Ctrl-L model` (this draft's model picker) and `Ctrl-V attach` are the keys that
+/// DID earn a place. They sit right after `Ctrl-O run interactively`, ending at
+/// columns 67 and 83. The model key is inside the 80 columns the help row draws; the
+/// hint is cut at 80, so an 80-column terminal shows `Ctrl-V att`, and the newline
+/// clause and `Esc cancel` behind it were already past the edge. On the card the two
+/// keys' 31 columns (97 before them, 128 with them) can cost another wrapped row on
+/// a narrow pane: the card wraps where the help row is cut, and that row is the price
+/// of the card sharing this const, which is what keeps the two surfaces from naming
+/// different keys.
 const BG_DRAFT_HINT: &str = "Enter start in background · Ctrl-O run interactively · \
-                             Ctrl-L model · Ctrl-J newline (or Alt+Enter) · Esc cancel";
+                             Ctrl-L model · Ctrl-V attach · Ctrl-J newline (or Alt+Enter) · Esc cancel";
 
 /// The draft card's key hint: the pick list's keys while the list is open, else the
 /// draft's own. The help row ([`compose_hint`]) and the card name the SAME keys for
@@ -2471,6 +2473,17 @@ fn render_compose_zone(frame: &mut Frame, app: &App, area: Rect) {
     // read), never by reading a file or the environment here in render.
     if let Some(default) = app.compose_default() {
         block = block.title_bottom(compose_model_label(compose.model.as_ref(), &default));
+    }
+    // A clipboard read in flight is typed state on the box itself, never a status.
+    if compose
+        .pending_attach
+        .as_ref()
+        .is_some_and(|p| p.shows_mark())
+    {
+        block = block.title_bottom(Line::styled(
+            super::compose::ATTACHING_LABEL,
+            Style::default().fg(Color::Yellow),
+        ));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -5814,10 +5827,10 @@ fn chord_hint(selected_hidden: bool) -> String {
 /// those keys for its editor, and [`BG_DRAFT_HINT`] is already past 80 columns.
 ///
 /// The model key (`Ctrl-L`, every target) was PAID FOR on the reply hint, which sat
-/// at 78 columns: its `^L model` segment costs 11, so the newline clause went from
-/// `Ctrl-J newline (or Alt+Enter)` to `^J/Alt+Enter newline` — both keys still
-/// named, in the board keymap's caret notation — which lands the hint at EXACTLY
-/// 80 (pinned by `the_reply_hint_fits_an_eighty_column_terminal`). The background
+/// at 78 columns: its `^L model` segment costs 11, so the newline clause shrank, in
+/// the board keymap's caret notation. `^V attach` (the same notation, 12 columns)
+/// then took the `/Alt+Enter` words (`Alt+Enter` stays in `KEYS` and the GUIDE), so
+/// the hint is 78 columns (pinned by `the_reply_hint_fits_an_eighty_column_terminal`). The background
 /// hint keeps its spelled-out keys: it was already cut at 80, and `Ctrl-L model`
 /// sits right after `Ctrl-O run interactively`, inside the columns that ARE drawn.
 ///
@@ -5830,7 +5843,7 @@ fn compose_hint(target: &ComposeTarget, list_open: bool) -> &'static str {
     match target {
         _ if list_open => COMPLETION_HINT,
         ComposeTarget::Reply { .. } => {
-            "Enter send · ^L model · ^J/Alt+Enter newline · PgUp/PgDn scroll · Esc cancel"
+            "Enter send · ^L model · ^V attach · ^J newline · PgUp/PgDn scroll · Esc cancel"
         }
         ComposeTarget::Fork { .. } => FORK_HINT,
         // The SAME const the draft card shows with the list closed ([`draft_hint`]),
@@ -5840,10 +5853,14 @@ fn compose_hint(target: &ComposeTarget, list_open: bool) -> &'static str {
 }
 
 /// The fork box's hint. `Enter` forks headless (no terminal hand-off) and `Ctrl-O`
-/// forks interactively; 70 columns, inside the 80-column help row (pinned by
-/// `the_fork_hint_is_pinned_and_fits_an_eighty_column_terminal`). It leaves out
-/// the transcript-scroll keys the reply hint names, which work here too.
-const FORK_HINT: &str = "Enter fork · ^O run interactively · ^L model · ^J newline · Esc cancel";
+/// forks interactively; 78 columns, inside the 80-column help row (pinned by
+/// `the_fork_hint_is_pinned_and_fits_an_eighty_column_terminal`). `^V attach` (12
+/// columns) took it from 70 to 82, and the `Ctrl-O` segment paid with its `run `:
+/// `^O interactively` still reads as the other way to fork, after `Enter fork`.
+/// It leaves out the transcript-scroll keys the reply hint names, which work here
+/// too.
+const FORK_HINT: &str =
+    "Enter fork · ^O interactively · ^L model · ^V attach · ^J newline · Esc cancel";
 
 /// The help row while the preview's find bar is open (and no chord, status or
 /// compose box owns the row): the keys the bar re-routes, in the board's own
@@ -6075,6 +6092,10 @@ const KEY_MAP: &[KeyMapSection] = &[
                 "pick the model (and effort) for this message only",
             ),
             (
+                "Ctrl-V",
+                "attach the clipboard's copied files or image (Enter and Ctrl-O wait for it)",
+            ),
+            (
                 "/ or @",
                 "pick list: skills and commands / files and agents",
             ),
@@ -6099,7 +6120,7 @@ const KEY_MAP: &[KeyMapSection] = &[
         rows: &[
             (
                 "paste",
-                "inserted as text, never sends: newlines kept in a box, spaces in the search",
+                "inserted as text, never sends: newlines kept in a box, spaces in the search; Cmd+V of copied files attaches them in a box",
             ),
             (
                 "F1",
@@ -14269,7 +14290,7 @@ going until a third line | alice |\n\
         let reply_hint = compose_hint(&plain.target, false);
         assert_eq!(
             reply_hint,
-            "Enter send · ^L model · ^J/Alt+Enter newline · PgUp/PgDn scroll · Esc cancel",
+            "Enter send · ^L model · ^V attach · ^J newline · PgUp/PgDn scroll · Esc cancel",
         );
         assert!(
             !reply_hint.contains("Ctrl-O"),
@@ -14281,6 +14302,7 @@ going until a third line | alice |\n\
         assert!(bg_hint.contains("Enter start in background"), "{bg_hint}");
         assert!(bg_hint.contains("Ctrl-O run interactively"), "{bg_hint}");
         assert!(bg_hint.contains("Ctrl-L model"), "{bg_hint}");
+        assert!(bg_hint.contains("Ctrl-V attach"), "{bg_hint}");
         for dishonest in ["review", "edit", "before sending", "prefill", "pre-fill"] {
             assert!(
                 !bg_hint.to_lowercase().contains(dishonest),
@@ -14360,9 +14382,9 @@ going until a third line | alice |\n\
         let hint = compose_hint(&fork, false);
         assert_eq!(
             hint,
-            "Enter fork · ^O run interactively · ^L model · ^J newline · Esc cancel"
+            "Enter fork · ^O interactively · ^L model · ^V attach · ^J newline · Esc cancel"
         );
-        assert_eq!(hint.width(), 70);
+        assert_eq!(hint.width(), 78);
         assert_eq!(compose_hint(&fork, true), COMPLETION_HINT);
     }
 
@@ -15581,7 +15603,7 @@ going until a third line | alice |\n\
     /// while the fixture's transcript still overflows it and bottom-anchors well past
     /// zero — the two conditions the card trap needs, both re-asserted below rather
     /// than trusted here.
-    const CARD_PANE: (u16, u16) = (40, 8);
+    const CARD_PANE: (u16, u16) = (40, 9);
 
     /// A new-session draft CARD is measured as itself, never as the transcript it
     /// replaced.
@@ -24231,6 +24253,24 @@ going until a third line | alice |\n\
         );
     }
 
+    /// `Ctrl-V` is ONE shared entry in the compose box's section, beside `Ctrl-L` and
+    /// `/` or `@` (AGENTS.md, KEEP KEY DOCS IN SYNC), never a copy per box, and it
+    /// says what it attaches and that `Enter` and `Ctrl-O` wait for the read.
+    #[test]
+    fn key_map_lists_ctrl_v_once_in_the_compose_section() {
+        let rows: Vec<(&str, &str)> = KEY_MAP
+            .iter()
+            .flat_map(|s| s.rows.iter().map(move |r| (s.title, r.1, r.0)))
+            .filter(|(_, _, k)| *k == "Ctrl-V")
+            .map(|(title, action, _)| (title, action))
+            .collect();
+        assert_eq!(rows.len(), 1, "one shared Ctrl-V row: {rows:?}");
+        assert_eq!(rows[0].0, "In a reply, fork or draft box");
+        for needle in ["copied files", "image", "Enter", "Ctrl-O"] {
+            assert!(rows[0].1.contains(needle), "{needle:?} in {:?}", rows[0].1);
+        }
+    }
+
     /// The widest key label the table carried before the subagent view's rows
     /// landed (`Backspace`, `PgUp/PgDn`, `dbl-click`: 9 display columns, measured
     /// at `0eac1c9`). `key_map_lines` sizes the key column to the widest label, so
@@ -27652,5 +27692,35 @@ going until a third line | alice |\n\
             rows[0], top_rows[0],
             "the top and bottom endpoints must pin DIFFERENT turns"
         );
+    }
+
+    /// The `attaching…` mark is typed state on the box: shown for the user's own
+    /// read, absent with no read and for the silent file-paste check.
+    #[test]
+    fn the_attaching_mark_shows_only_for_an_explicit_read() {
+        use crate::tui::compose::{AttachPurpose, ComposeState, PendingAttach};
+        let draw = |purpose: Option<AttachPurpose>| {
+            let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+            app.open_compose(ComposeState::new_background(None), None);
+            app.compose.as_mut().unwrap().pending_attach = purpose.map(|purpose| PendingAttach {
+                token: 1,
+                requested: true,
+                purpose,
+            });
+            let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("test terminal");
+            terminal
+                .draw(|frame| render_compose_zone(frame, &app, frame.area()))
+                .expect("the compose zone must draw");
+            buffer_rows(terminal.backend().buffer(), 60, 6).join("\n")
+        };
+        let mark = crate::tui::compose::ATTACHING_LABEL.trim();
+        assert!(draw(Some(AttachPurpose::Explicit)).contains(mark));
+        assert!(!draw(None).contains(mark));
+        let upgrade = AttachPurpose::Upgrade {
+            inserted: String::new(),
+            lines_after: Vec::new(),
+            cursor_after: (0, 0),
+        };
+        assert!(!draw(Some(upgrade)).contains(mark));
     }
 }

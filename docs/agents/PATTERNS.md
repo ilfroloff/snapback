@@ -91,6 +91,19 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   repository's settings, and with them its helper commands and `env` block, and
   leave claude's own git prefetch running its git configuration, just because a
   compose box opened.
+- The compose attach's clipboard READ (`tui::clipboard`) is the same again, over
+  OS tools' output rather than claude's: the listing parsers skip any line they
+  do not recognise, a `text/uri-list` keeps only `file://` URIs whose every
+  escape is well formed and that decode to UTF-8 (a malformed escape refuses
+  its URI rather than guessing a path), and a FILES step that fails is no files. Its direction is toward
+  ATTACHING NOTHING: an unfinished or over-cap listing, a timeout, a failed image
+  step or an empty image is `Failed`, an explicit attach that gets no attachment
+  is a sticky refusal over a byte-identical draft, and nothing goes into a draft
+  that the clipboard did not report. The one exit read as a FACT rather than a
+  failure is a tool's own empty-clipboard exit (`classify_list_exit`, per
+  backend: [DOMAIN.md](DOMAIN.md#reading-the-clipboard-tuiclipboard)). The other
+  direction would put a mention of something the user never copied into a
+  message claude then reads.
 - The subagent meta files the preview joins launches against (`store::subagents`,
   which files and which fields is [DOMAIN.md](DOMAIN.md#the-four-file-kinds)'s)
   are the same again: each is a `Value`, and an unreadable dir, a symlink, FIFO or
@@ -127,6 +140,9 @@ The JSONL format is external and undocumented, so treat every read as hostile:
   comes up. Its WRITE fails the other way, and on purpose: a file the save cannot
   read is REFUSED (a status, the file untouched), never treated as empty, because
   the write replaces the whole file and would destroy hides it never saw.
+  The compose attach's paste cache beside it is CACHE, never read back: its image
+  writes are atomic the same way and its prune skips what it cannot read
+  ([DOMAIN.md](DOMAIN.md#the-paste-cache)).
   The two write postures (owned state; gated store mutation) are the AGENTS.md
   critical rules; their store/layout mechanism is in
   [DOMAIN.md](DOMAIN.md#snapback-owned-state-srchiddenrs).
@@ -350,8 +366,8 @@ it. Follow this split when adding behavior:
   delegating to the pure `global_config_path`, `trust_keys` and `is_trusted`
   through `folder_trust_in`, which tests drive with a temp record) and
   `claude_catalog::kill_group` (the crate's other signal syscall, `killpg(2)` with
-  SIGKILL on a timed-out catalog fetch's or `Ctrl-X w` move's own child group,
-  reached in tests only through stand-in children, `sh` and one `perl` leader: see
+  SIGKILL on a timed-out catalog fetch's, `Ctrl-X w` move's or clipboard read's
+  own child group, reached in tests only through stand-in children, `sh` and one `perl` leader: see
   [Testing patterns](#testing-patterns)) and `claude_move::check_target` (the
   move's folder pre-checks, an `is_dir` and one `resolve_dir`, so only its worker
   calls it). Keep these small and delegate to tested helpers.
@@ -1219,6 +1235,53 @@ request (`App::forget_subagent_request`) and the next board asks anew.
 `spawn_subagent_refresh_thread` takes its `read` as a parameter, the seam the
 suite states (and blocks) answers through.
 
+`clipboard::spawn_clipboard_read` is the tenth: the compose attach's clipboard
+read, delivered as a single `AppEvent::ClipboardRead`. It splits the decision from
+the spawn exactly as the catalog fetch does. `Ctrl-V`, an empty paste or a
+copied-file-shaped paste only records a `PendingAttach` on the compose
+(`compose::request_attach`); the run loop asks the pure
+`compose::take_clipboard_read` after every wake-up, and only the driver
+(`run_inner` → `start_clipboard_read`) reads the environment, picks the route and
+starts the worker — or, over SSH or with no display, sends the refusal at once and
+spawns nothing. The worker lists, chooses, reads and saves, and never touches the
+terminal. Its children are bounded by snapback, as the catalog's are: each runs
+with stdin and stderr null as the leader of a process group of its own
+(`claude_catalog::NEW_PROCESS_GROUP`), and past `CLIPBOARD_READ_TIMEOUT` the
+worker kills the whole group through the SAME `claude_catalog::kill_group`, and
+the child itself, both before the reap. The wait for the stdout reader is bounded
+too, by `READ_STDOUT_GRACE`, and its expiry is `Failed`, never a partial listing:
+it can only expire while a DESCENDANT still holds stdout, one that left the group
+or that outlived a child which exited by itself (a reaped child's group is never
+signalled), and that reader thread ends with its writer. So a hung tool costs
+its worker at most the timeout plus the grace per step, and the compose's
+pending attach always settles — and the box need not wait that long, since `Esc`
+drops an explicit read at once (`compose::esc_cancels_attach`), its late result
+then a stale token. Nothing waits on the event, and it carries no
+shutdown flag for the alias probe's reason; a hand-off closes the compose that
+asked, so a late result is dropped as a stale token.
+
+The paste cache's two deleters are a shape of their own, not event-delivering
+workers like the ones above: each is a fire-and-forget detached thread that
+reports NOTHING, started by the driver, its handle dropped (which detaches it),
+that runs one fail-soft delete pass and ends. It needs no `AppEvent` because no
+state waits on it, and no shutdown flag because it cannot loop; neither is an
+exception below, since neither ever runs on the UI thread or on a key.
+
+- `clipboard::spawn_paste_cache_prune`: `run_inner` starts it at every board start
+  (launch and every return from a `claude` child), over `config::paste_cache_dir()`.
+  It runs the cache's one prune (`prune_expired`, the same function the read worker
+  runs before an image write) and ends.
+- `clipboard::spawn_paste_image_discard`: the STALE-IMAGE discard. A read whose
+  result `finish_attach` dropped (`Esc` cancelled it, or its compose is gone)
+  saved an image no draft holds. `finish_attach` only records that path
+  (`App::stale_paste_images`), so nothing is deleted on the UI thread; the run loop
+  drains it after every wake-up through the pure `compose::take_stale_paste_images`
+  and hands a non-empty answer to the thread, which deletes only a path
+  `is_discardable_paste_image` accepts (a cache-named file directly in the cache dir)
+  that is a regular file, never a symlink, and ignores every error: what it cannot
+  delete is left to the prune. The gap this closed: a dropped result would
+  otherwise have sat in the cache until its TTL.
+
 The rule is about the **poll cadence**, not about the word "shell-out". A
 ONE-SHOT at hand-off is a different thing and is allowed — `agents::live_agents`
 is the instance, directly analogous to `resume`'s authoritative re-read of
@@ -1318,6 +1381,13 @@ four named exactly once, in `spawn_move` (`agents::try_live_agents`,
 `claude_trust::folder_trust`, `claude`, `MOVE_TIMEOUT`), so the suite drives a
 move with a stated liveness answer (a probe that could not answer included), a
 stated trust record and a stand-in child.
+`clipboard::spawn_clipboard_read` takes its `backend` (the `ReadBackend` whose
+steps it runs, real ones built only by `ReadBackendKind::backend`, named once in
+`start_clipboard_read`) and its cache directory the same way, and
+`clipboard::spawn_paste_cache_prune` and `clipboard::spawn_paste_image_discard`
+their directory (`config::paste_cache_dir()`, named ONCE in `run_inner`, for both
+deleters), so the suite drives a read with `sh` stand-ins, a scratch directory and
+a shortened timeout, and never reads the real clipboard or touches the real cache.
 Nothing else
 may pass anything else: the seam exists so a test can state a poll's answer without spawning `claude`, state
 an input event without a TTY, state an alias set without walking a 290 MB
@@ -1336,8 +1406,13 @@ everything downstream of it is pinned through the seam. The `run_inner` lines th
 START these threads (`spawn_agents_poller`, `spawn_model_alias_probe`,
 `spawn_settings_model_probe`, the `claude_catalog::spawn_fetch` call behind
 `compose::take_catalog_fetch`, the `claude_move::spawn_move` call behind
-`Outcome::Move`, and the `EventLoop::spawn_subagent_refresh` call with the
-`request` behind `App::take_subagent_refresh`) are
+`Outcome::Move`, the `EventLoop::spawn_subagent_refresh` call with the
+`request` behind `App::take_subagent_refresh`, the `start_clipboard_read` call
+behind `compose::take_clipboard_read` — whose no-tool refusals ARE pinned, since
+they spawn nothing — the `clipboard::spawn_paste_cache_prune` call, and the
+`clipboard::spawn_paste_image_discard` call behind
+`compose::take_stale_paste_images`, whose decision IS pinned and whose threads are
+pinned through their own tests) are
 accepted the same way and for the same reason: `run_inner` needs a real terminal,
 so there is nothing to assert them from, while the thread's shape is pinned
 through the seam and the event's effect through `update::dispatch` — the gap is
@@ -1593,6 +1668,8 @@ CADENCES and LIMITS, so a retune knows what it is next to:
 | `command_kinds` | `MAX_ENTRIES` (5000 — directory entries one read looks at over every folder together; real folders hold tens to ~100) · `MAX_COMMAND_DEPTH` (8 — ends a symlink cycle under `commands/`) · `MAX_SKILL_HEAD_BYTES` (16 KiB — the frontmatter head read of a `SKILL.md`) |
 | `claude_move` | `MOVE_TIMEOUT` (30 s — the answer, the close of stdout AND the exit together; a move measured ~0.7 s end to end on a small transcript at claude 2.1.291, and `-r` loads the whole transcript first, so the cap only ever cuts off a stuck child) |
 | `claude_trust` | `GIT_POINTER_MAX_BYTES` (8192 — a git pointer file holds one path line, and a path is at most `PATH_MAX`, so a longer file is not a pointer and gets the untrusted-direction fallback rather than a whole read) |
+| `tui::compose` | `PASTE_FILE_NAMES_MAX_CHARS` (1024 — the longest paste the copied-file upgrade asks the clipboard about; longer is prose, and a child read is not spent on it) · `FILE_EXTENSION_MAX_CHARS` (8 — the longest extension that makes a bare word look like a file name) |
+| `tui::clipboard` | `CLIPBOARD_READ_TIMEOUT` (10 s — per read child, then its whole group is killed) · `READ_POLL_INTERVAL` (10 ms) · `READ_STDOUT_GRACE` (500 ms — the bounded wait for a read child's stdout reader, the catalog's reader grace) · `PASTE_IMAGE_MAX_BYTES` (25 MiB) · `LIST_MAX_BYTES` (1 MiB) · `PASTE_CACHE_TTL` (7 days — the paste cache's one prune age) |
 | `tui::complete` | `COMPLETION_MAX_DIR_ENTRIES` (2000 — one keystroke's worst read of a huge folder) · `COMPLETION_MAX_TREE_ENTRIES` (25000 — the whole `@` walk, breadth first, no depth cap: a depth cap hid a 9-level monorepo path) · `COMPLETION_VISIBLE_ROWS` (8) |
 | `tui::app` | `PREVIEW_WHEEL_STEP` (2) · `LIST_WHEEL_STEP` (1) · `STATUS_DWELL_TICKS` (16) · `MIN_PANE_WIDTH` (15) · the list's share of the body per split `PaneLayout` stop: `PREVIEW_WIDE_LIST_PERCENT` (25) / `DEFAULT_LIST_PERCENT` (48) / `LIST_WIDE_LIST_PERCENT` (75) · a held drag's autoscroll: `AUTOSCROLL_FRAME` (33 ms, the run loop's wait deadline while one is held past the edge — §7's one exception to animating from the tick) / `AUTOSCROLL_PAGE_PERIOD` (1 s, a page per row past the edge) / `AUTOSCROLL_MAX_DISTANCE` (4) |
 | `tui::update` | `PASTE_MAX_CHARS` (4096 — the BOARD query's paste cap in chars; a compose paste is capped by `send::COMPOSE_PROMPT_MAX_BYTES` instead) |
@@ -1622,7 +1699,16 @@ ends a subagent's run, and the measured `stop_reason` tokens
 `FINAL_STOP_REASONS` that make its text a final reply;
 `tui::complete`'s `AGENT_MENTION_PREFIX` / `AGENT_LABEL_SUFFIX` /
 `COMMAND_LABEL_PREFIX`, and its token splitters `QUERY_PART_SEPARATORS` and
-`ROOT_FALLBACK_SEPARATORS`, the second built from the first), the raw control bytes the
+`ROOT_FALLBACK_SEPARATORS`, the second built from the first; the `@` boundary
+claude's mention extractor accepts is the `is_mention_boundary` predicate, its
+set spelled out in one `matches!` rather than derived from `char::is_whitespace`),
+the clipboard READ's tool facts (`tui::clipboard`'s per-step argv consts —
+`MACOS_LIST`, `MACOS_PNG_IMAGE`, `MACOS_RAW_IMAGE`, `WL_PASTE_*`, `XCLIP_*` — with
+their `TYPE_PLACEHOLDER` / `DEST_PLACEHOLDER` slots, `URI_LIST_TYPE`, the
+empty-clipboard exits `WL_PASTE_NOTHING_COPIED_EXIT` / `XCLIP_NO_OWNER_EXIT`, the
+cache names `PASTE_FILE_PREFIX` / `PASTE_TEMP_LEAD` / `PASTE_TEMP_SUFFIX` and the
+dir's `PASTE_DIR_MODE`; `tui::compose`'s status wordings, the `ATTACHED_*`
+confirmation consts among them), the raw control bytes the
 terminal seams write because crossterm publishes no typed command for them
 (`tui`'s `CAN` / `ST` / `KITTY_DISABLE_KEYBOARD` / `DECSTR` / `DECCKM_OFF`, and
 `tui::clipboard`'s OSC 52 wire bytes `OSC_INTRODUCER` / `OSC52_COMMAND` /
@@ -1847,8 +1933,15 @@ Input handling is a three-stage pipeline, all terminal-free and testable:
    reply sent one line, and a `Ctrl-N` background draft launched an agent on one.
    `compose_key_to_action` also takes `list_open`: with the pick list open (in
    any compose box — the router never sees the target) bare `Enter`/`Tab` pick, `Up`/`Down` choose and `Esc` closes the list;
-   `Ctrl-J`, `Alt`/`Shift+Enter` and `Ctrl-O` decode as ever, and `false` decodes
-   exactly as before. Each key needs its decode test AND a `handle_event` test.
+   every other key decodes as ever (`Ctrl-J`, `Alt`/`Shift+Enter`, `Ctrl-O`,
+   `Ctrl-L`, `Ctrl-V` and the transcript scroll keys among them), and `false`
+   decodes exactly as before. A key whose meaning depends on the box's own state
+   beyond the list is narrowed in its `handle_compose_key` arm by a pure
+   predicate, never in the router: `Send` and `OpenInteractive` wait while
+   `compose::submit_waits_for_attach` holds, and `Cancel` drops the explicit
+   attach first while `compose::esc_cancels_attach` does, so `Esc` unwinds the
+   list, then the read, then the box. Each key needs its decode test AND a
+   `handle_event` test.
 
    `draft` is the one arm that is not a keyboard owner: it owns the **pane**. While
    the new-session draft card is drawn the transcript is not, so the cached link
@@ -1943,25 +2036,38 @@ hint's `F1 keys` points at the same modal in most terminals; where F1 does not
 arrive (GNOME Terminal keeps it, a Mac laptop needs `Fn`), `Ctrl-X ?` is found
 through `sb --help`, `docs/GUIDE.md` or the key map itself.
 
-A COMPOSE key (`Ctrl-J`, `Ctrl-O`, `Ctrl-L`) is added a third way: a
+A COMPOSE key (`Ctrl-J`, `Ctrl-O`, `Ctrl-L`, `Ctrl-V`) is added a third way: a
 `ComposeAction` variant + its `compose_key_to_action` arm (both letter cases, for
 the kitty path) + its `handle_compose_key` arm. It belongs to the compose box and
-not to the board, so it is named in `view::compose_hint` (the reply hint fits 80
-columns exactly, so a new segment is paid for by shrinking another; a draft's key
-lands in `BG_DRAFT_HINT`, which the draft card shows too through `draft_hint`,
-and a fork box's in `FORK_HINT`, which fits 80 columns whole) and
-NOT in the board keymap or `chord_hint`. A NEW key must be FREE on the whole path to that
+not to the board, so it is named in `view::compose_hint` and NOT in the board
+keymap or `chord_hint`. Each compose hint has its own column budget. The reply
+hint is 78 columns of the 80-column help row, too few spare for another segment,
+so a new one is paid for by shrinking another (`^V attach` took the `/Alt+Enter`
+words). `FORK_HINT` is 78 columns too, paid the same way (`^V attach` took the
+`run ` of `^O run interactively`). A draft's key lands in `BG_DRAFT_HINT`, which
+the draft card shows too through `draft_hint`; it is 128 columns and cut at 80,
+so only its leading keys are drawn on an 80-column terminal (`Ctrl-L model` ends
+at column 67, while `Ctrl-V attach` ends at 83 and is drawn as `Ctrl-V att`).
+`view.rs` tests pin the reply hint inside 80, `FORK_HINT` at exactly 78, and
+`Ctrl-L model` inside the drawn columns of `BG_DRAFT_HINT`. A NEW key must be FREE on the whole path to that
 router, and each claim needs evidence rather than a guess, because a key stolen
 anywhere upstream reads as the key doing nothing: the pinned `ratatui-textarea`
 must not bind it (`TextArea::input` at `=0.9.2` binds `Ctrl-` + `m h d k j w n p
-f b a e u r y x c v`, so a bump re-checks it — `Ctrl-J` is the one deliberate
-exception, taken from the widget's delete-to-line-head because it is the newline
-byte a raw-mode terminal sends); the terminal must not alias it
+f b a e u r y x c v`, so a bump re-checks it). There are TWO deliberate
+exceptions: `Ctrl-J`, taken from the widget's delete-to-line-head because it is
+the newline byte a raw-mode terminal sends, and `Ctrl-V`, which shadows the
+widget's page-down because it is the compose attach key, while the page-down it
+takes stays on `PgDn` (a draft's editor keeps it, and a reply's or fork's `PgDn`
+scrolls the preview). The terminal must not alias it
 (crossterm delivers `Ctrl-M`/`Ctrl-I`/`Ctrl-H`/`Ctrl-[` as Enter/Tab/Backspace/Esc,
 and `Ctrl-S`/`Ctrl-Q`/`Ctrl-Z`/`Ctrl-C` are flow or job control); and a common
 multiplexer must not take it first (Zellij's default keymap swallows `Ctrl-G` and
 `Ctrl-T`). `Ctrl-L` passed all three, and `ComposeAction::PickModel` keeps the
-argument next to the arm.
+argument next to the arm. `ComposeAction::AttachClipboard` keeps the page-down
+argument next to its own. `Ctrl-V` is not free at every terminal either: one
+that binds it as its own paste never delivers it, and the attach is still reached
+there through the terminal's paste — an empty one, or a copied file's path
+([DOMAIN.md](DOMAIN.md#compose-attach-ctrl-v)).
 
 The deliberate exception to "free on the whole path" is the board's transcript
 scroll set (`ComposeAction::PreviewTop` / `PreviewBottom` / `PreviewPageUp` /
@@ -2103,6 +2209,28 @@ state and renders on the surface that owns it:
   own bottom border (`view::compose_model_label`), not on the help line: the
   picker's confirm sets no status, and neither `AppEvent::SettingsModel` nor
   `AppEvent::ModelAliases` writes `App::status` when it lands;
+- a compose attach's clipboard read in flight lives in
+  `ComposeState::pending_attach` and renders as `attaching…`
+  (`compose::ATTACHING_LABEL`) on that compose box's own bottom border, never on
+  the help line — and only for the user's own read (`PendingAttach::shows_mark`),
+  never for the silent copied-file check. Its `AppEvent::ClipboardRead` is the
+  OUTCOME: a screenshot that lands says nothing (the attachment placeholder is the
+  message), and COPIED FILES that land are confirmed with a TRANSIENT
+  `attached "<full path>"` (`compose::confirm_attached`, the path escaped as the
+  refusal lines show one), because their placeholder names only the file name; that
+  confirmation never replaces a sticky status (`App::has_sticky_status`: a refusal,
+  or a deliberately sticky confirmation), so a refusal always wins. A compose
+  paste, an empty one included, clears the status first, like a key, so a stale
+  refusal does not hide it.
+  Every refusal is sticky — each result that attaches nothing, and the
+  `not attached: …` / `paste kept as text, cannot attach: …` lines naming each
+  path a mention cannot carry — and a second `Ctrl-V` (or an empty paste) while
+  a read is pending is a transient nudge (`ATTACH_BUSY_HINT`), as are `Enter`
+  (`ENTER_WHILE_ATTACHING_HINT`) and a fork's or draft's `Ctrl-O`
+  (`CTRL_O_WHILE_ATTACHING_HINT`) while the box's own explicit read is: all are
+  keypresses that did nothing, not outcomes of the read. The `Esc` that cancels
+  that read is a transient nudge too (`ATTACH_CANCELLED_HINT`): the keypress's own
+  outcome, which leaves the draft as it was;
 - how long a reported session has been running lives in typed state and renders
   on the preview banner (`live busy · 46m`, after the pinned turn marker for a live
   agent, alone as the fallback for a marker-less transcript), not on the help
@@ -2345,7 +2473,10 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   `tui::start_copy` take the tool list as a parameter, so a test hands in a
   harmless stand-in (`sh`, `cat`, `false`), and the OSC 52 fallback reaches a
   `Vec<u8>` through the `Write`-generic `update::finish_copy`, never the test
-  run's terminal. No browser opens either: a link click is decided by the pure
+  run's terminal. The clipboard READ is the same: `clipboard::spawn_clipboard_read`
+  takes a `ReadBackend` the tests build from `sh` stand-ins and a scratch cache
+  directory, and `tui::start_clipboard_read`'s tests take only the routes that
+  spawn nothing. No browser opens either: a link click is decided by the pure
   `update::mouse_effect`, which RETURNS the url a release would open
   (`MouseEffect::OpenLink`) instead of handing it to `resume::open_url` — only
   the thin `handle_mouse` does that — so a test presses and releases over a real
@@ -2357,7 +2488,13 @@ Tests are **inline** `#[cfg(test)] mod tests` at the bottom of each source file
   `PATH` (macOS and the `ubuntu-latest` CI runner ship it), because `sh` cannot
   `setpgid` itself. Without `perl` it FAILS on its marker assertion, never passes
   vacuously. The `Ctrl-X w` move's child tests (`claude_move`'s unix-only
-  `children` module) run `sh` alone, over the same `exchange_reaped`. The two
+  `children` module) run `sh` alone, over the same `exchange_reaped`. The
+  clipboard read's run `sh`, `true` and `sleep` through `run_capture`; two
+  unix-only ones (`a_timed_out_read_kills_the_grandchild_holding_its_stdout`,
+  `a_descendant_holding_stdout_cannot_hang_the_read`) have the stand-in record
+  its background `sleep`'s pid, ask whether it is gone with `kill(pid, 0)` and
+  SIGKILL it if a failed run left it — the only signal calls written in a test,
+  each aimed at a `sleep` that test itself started. The two
   tests that query the kernel, in `agents` and on macOS and Linux only, each
   spawn a `sleep` child and kill it themselves.
   `the_kernel_check_keeps_a_running_process_and_calls_an_exited_one_gone` asks

@@ -376,8 +376,51 @@ pub enum AppEvent {
         /// Its subagents, in launch order ([`subagents::read_record`]).
         record: SubagentRecord,
     },
+    /// A clipboard READ for a compose box's `Ctrl-V` attach finished, delivered OFF
+    /// the UI thread by [`crate::tui::clipboard::spawn_clipboard_read`].
+    ///
+    /// Like [`CopyFinished`](Self::CopyFinished) it fires EXACTLY ONCE per request,
+    /// from a thread spawned for that one read. `token` identifies the request, so
+    /// a result for a compose that has since closed or been replaced is dropped
+    /// rather than inserted into a draft that never asked.
+    ClipboardRead {
+        /// The request this answers (the compose's pending attach token).
+        token: u64,
+        /// What the clipboard held, or why nothing can be attached.
+        result: ClipboardAttach,
+    },
     /// A periodic wake-up. The update loop does nothing costly on this.
     Tick,
+}
+
+/// What a clipboard READ found, or why it cannot be attached. Declared here,
+/// beside [`AppEvent::ClipboardRead`], so this module never imports the TUI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClipboardAttach {
+    /// Copied file(s), any type, to be referenced IN PLACE.
+    Files(Vec<PathBuf>),
+    /// Image data, saved at this path under the paste cache.
+    Image(PathBuf),
+    /// Image data NOT saved: `complete::file_mention` refuses the cache path it
+    /// would take (a `#` in the config dir, say), named here so the compose's
+    /// refusal can name it and its cause.
+    Unmentionable(PathBuf),
+    /// Only text: the terminal's own paste carries it.
+    TextOnly,
+    /// An empty clipboard.
+    Nothing,
+    /// Image data in a format claude cannot read (e.g. only BMP).
+    UnsupportedImage,
+    /// An image over the size cap.
+    TooLarge,
+    /// snapback runs over SSH: a local tool would read the REMOTE clipboard.
+    RemoteSession,
+    /// No display to ask (Linux without Wayland or X11, or another OS).
+    NoDisplay,
+    /// The clipboard tool is not installed.
+    NoTool,
+    /// The read timed out or a tool failed or wrote an unusable result.
+    Failed,
 }
 
 /// What one clipboard copy carries: the TEXT to place on the clipboard, and what

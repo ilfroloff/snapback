@@ -96,13 +96,15 @@
 //! # Why the cache is in memory — a second resolved rule conflict
 //!
 //! The result is cached in a process-lifetime [`OnceLock`] and NOTHING is written
-//! to disk. `src/config.rs` reserves a home for "any future cache", but that is an
-//! adjacent artifact and cannot override a critical rule. AGENTS.md's THE PARSE
+//! to disk. `src/config.rs` resolves a home for snapback-owned cache (today the
+//! paste cache), but that is an adjacent artifact and cannot override a critical
+//! rule. AGENTS.md's THE PARSE
 //! CACHE rule sits directly above SNAPBACK-OWNED STATE and settles this category
 //! outright — *"Keep the cache IN MEMORY (derived state, not the owned state
 //! below)."* The alias list is DERIVED state, derived from the claude binary, and
 //! is the same category as the parse cache. SNAPBACK-OWNED STATE keeps the
-//! per-session state map as the ONLY persistent state snapback writes, and this
+//! per-session state map as the ONLY persistent state snapback writes (the paste
+//! cache is prunable cache beside it), and this
 //! module leaves that true. One background scan per launch costs nothing, for the
 //! same reason the scan speed does not matter: nothing waits on it.
 
