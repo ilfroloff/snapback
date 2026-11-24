@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0](https://github.com/ilfroloff/snapback/compare/v0.16.0...v0.17.0) - 2026-11-24
+
+### Added
+
+- show what a needs-input agent is waiting for
+- list every Ctrl key on the help row and drop the last ones to fit
+- find text in the previewed transcript with Ctrl-F
+- move fork to Ctrl-X f and the lineage fold to Ctrl-X z
+
+### Fixed
+
+- refuse deleting a session whose agent reads working beside idle
+- *(tui)* keep the move picker's main row right in submodules and show label ends
+- keep a preview drag inside the table cell it started in
+
 ## [0.16.0](https://github.com/ilfroloff/snapback/compare/v0.15.0...v0.16.0) - 2026-11-18
 
 ### Added
