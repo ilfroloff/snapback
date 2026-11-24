@@ -65,29 +65,38 @@
 //! folder is fetched off the UI thread, requested by [`take_catalog_fetch`].
 //!
 //! A draft too long to be one `claude` argument ([`send::check_prompt_len`]) is
-//! REFUSED before any target routes: `Enter` in all three boxes ([`submit_compose`])
-//! and `Ctrl-O` in the fork box and the draft ([`open_interactive`], the reply's
-//! being inert). The box stays open with the draft intact — see [`refuse_too_long`].
+//! REFUSED before any target routes, measured as it will be SENT (each attachment
+//! placeholder expanded, [`draft`]) and after a box waits for its own attachment
+//! read ([`submit_waits_for_attach`]): `Enter` in all three boxes
+//! ([`submit_compose`]) and `Ctrl-O` in the fork box and the draft
+//! ([`open_interactive`], the reply's being inert). The box stays open with the
+//! draft intact — see [`refuse_too_long`].
 //!
-//! [`insert_paste`] is the ONE entry point that is not a keypress: a terminal paste
-//! arrives as whole TEXT (`super::update::handle_paste`) and goes straight into the
-//! editor, bypassing the key router entirely. That bypass is the point — routed as
-//! keystrokes, a pasted newline reached the `Enter` = Send arm above.
+//! [`insert_paste`] is where the TEXT of a terminal paste enters: it arrives whole
+//! (`super::update::handle_paste`) and goes straight into the editor, bypassing the
+//! key router entirely. That bypass is the point — routed as keystrokes, a pasted
+//! newline reached the `Enter` = Send arm above. An EMPTY paste takes no text: it
+//! asks for the same clipboard attach as `Ctrl-V` ([`request_attach`]).
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
+use super::clipboard::{ReadMode, FILE_URI_SCHEME};
 use crate::resume::ModelPick;
 use crate::send::{self, BgLaunchRequest, SendPlan, SendRequest};
 use crate::store::skills::{read_listing, Listing};
+use crate::watch::ClipboardAttach;
 
 use super::app::{App, NewSessionDraft};
 use super::complete::{
-    at_candidates, at_list, completion_context, filter_commands, list_tree, move_highlight,
-    replacement, settle_highlight, split_path_query, Candidate, Context, DirEntryInfo, Trigger,
+    at_candidates, at_list, attachment_placeholder, completion_context, file_mention,
+    filter_commands, is_mention_boundary, list_tree, mention_insert_text, move_highlight,
+    replacement, settle_highlight, split_path_query, AttachmentKind, Candidate, Context,
+    DirEntryInfo, MentionRefusal, Trigger,
 };
 use super::update::Outcome;
 
@@ -122,6 +131,92 @@ const COMPOSE_SESSION_GONE: &str = "that session is no longer loaded — nothing
 /// over.
 pub(super) const COMPOSE_FORK_SESSION_GONE: &str =
     "that session is no longer loaded — nothing forked";
+
+/// Status when `Ctrl-V` (or an empty paste) arrives while a clipboard read is
+/// already running: one attach at a time, so this is a nudge, not a refusal.
+const ATTACH_BUSY_HINT: &str = "already reading the clipboard — one attach at a time";
+
+/// Status when `Enter` arrives while the box's own attach is still reading
+/// ([`submit_waits_for_attach`]): nothing is sent, and the draft and the read stay
+/// as they were, so this is a nudge, not a refusal.
+pub(crate) const ENTER_WHILE_ATTACHING_HINT: &str =
+    "still attaching — press Enter again once it lands";
+
+/// The [`ENTER_WHILE_ATTACHING_HINT`] of `Ctrl-O`, the fork box's and the draft's
+/// interactive run ([`submit_waits_for_attach`]): nothing is handed off, and the
+/// draft and the read stay as they were, so this is a nudge, not a refusal. Its
+/// own const because it names the key to press again.
+pub(crate) const CTRL_O_WHILE_ATTACHING_HINT: &str =
+    "still attaching — press Ctrl-O again once it lands";
+
+/// Status when `Esc` cancels the box's own explicit attach instead of the box
+/// ([`esc_cancels_attach`]): the draft stays as it was and the read's late result
+/// is dropped as a stale token, so this is a nudge that expires, not a refusal.
+pub(crate) const ATTACH_CANCELLED_HINT: &str =
+    "attach cancelled — press Esc again to close the box";
+
+/// The in-flight mark on the compose box's border while a clipboard read runs.
+/// Typed state rendered on the box itself, never on the status line (STATUS-LINE
+/// OWNERSHIP).
+pub(crate) const ATTACHING_LABEL: &str = " attaching… ";
+
+/// Refusal when the clipboard holds only text: the terminal's own paste carries it.
+const ATTACH_TEXT_ONLY: &str =
+    "clipboard holds text only — paste it with ⌘V / Ctrl-Shift-V (Ctrl-V attaches files and images)";
+/// Refusal when the clipboard is empty.
+const ATTACH_NOTHING: &str = "nothing to attach — the clipboard is empty";
+/// Refusal for an image format claude cannot read.
+const ATTACH_UNSUPPORTED_IMAGE: &str =
+    "that image format is not supported — copy a PNG, JPEG, GIF or WebP";
+/// Refusal for an image over the size cap.
+const ATTACH_TOO_LARGE: &str = "that image is too large to attach";
+/// Refusal over SSH, where a local tool would read the REMOTE clipboard.
+const ATTACH_REMOTE: &str = "cannot read the clipboard over SSH — it would be the remote machine's";
+/// Refusal when there is no display to ask.
+const ATTACH_NO_DISPLAY: &str = "no display to read a clipboard from";
+/// Refusal when the clipboard tool is missing.
+const ATTACH_NO_TOOL: &str =
+    "clipboard tool not found — install wl-clipboard (Wayland) or xclip (X11)";
+/// Refusal when the read timed out or the tool failed.
+const ATTACH_FAILED: &str = "could not read the clipboard";
+/// Leads the refusal of an explicit attach some of whose paths no mention can
+/// carry; the others still go in.
+const ATTACH_REFUSED_PREFIX: &str = "not attached: ";
+/// Leads the refusal of a copied-file paste that stays verbatim because one of
+/// its files no mention can carry: a paste is upgraded whole or not at all.
+const PASTE_KEPT_PREFIX: &str = "paste kept as text, cannot attach: ";
+/// Between a refused path and its cause ([`MentionRefusal::describe`]).
+const ATTACH_REFUSED_CAUSE_SEPARATOR: &str = " — ";
+/// Between two refused paths.
+const ATTACH_REFUSED_SEPARATOR: &str = "; ";
+/// Leads the confirmation of copied files attached: their placeholder shows only a
+/// file name, so the status names the full path the mention will carry.
+const ATTACHED_PREFIX: &str = "attached ";
+/// Around the count of further files in the confirmation of several: ` (+2 more)`.
+const ATTACHED_MORE_OPEN: &str = " (+";
+const ATTACHED_MORE_CLOSE: &str = " more)";
+
+/// The longest paste, in characters, that [`paste_may_name_files`] will ask the
+/// clipboard about. A pasted file path or a few names are short; anything longer
+/// is prose, and the cap keeps a large paste from costing a child read.
+const PASTE_FILE_NAMES_MAX_CHARS: usize = 1024;
+
+/// The longest extension, in characters, that makes a bare word look like a file
+/// name (`report.pdf`, `shot.jpeg`, `notes.markdown`).
+const FILE_EXTENSION_MAX_CHARS: usize = 8;
+
+/// How a one-line paste that names files by PATH starts, so [`paste_may_name_files`]
+/// asks the clipboard about it unless it names a URI scheme other than `file`: an
+/// absolute path, raw or backslash-escaped (iTerm2 escapes inside the path, never
+/// its leading `/`); a `file://` URI; an absolute path in single or double quotes.
+/// Those are the path renderings [`paste_names_files`] matches. `~/` is asked
+/// about too, though no rendering matches it: the clipboard's paths are absolute,
+/// so that read never upgrades.
+const PASTE_PATH_PREFIXES: [&str; 5] = ["/", "~/", FILE_URI_SCHEME, "'/", "\"/"];
+
+/// Ends a URI scheme that names an authority (RFC 3986 §3): `https://`, and the
+/// `file://` [`FILE_URI_SCHEME`] opens with.
+const URI_AUTHORITY_MARK: &str = "://";
 
 /// What an open compose buffer is addressed to — the ONE fork the shared editor
 /// and key router branch on.
@@ -199,6 +294,81 @@ pub struct ComposeState {
     /// The `/` and `@` pick list of this draft, reply, fork and background draft
     /// alike (see [`CompletionState`]).
     pub completion: CompletionState,
+    /// The clipboard read this compose is waiting on, if any (see
+    /// [`PendingAttach`]). Born `None` and dies with the compose, or with the `Esc`
+    /// that cancels an explicit one ([`esc_cancels_attach`]).
+    pub pending_attach: Option<PendingAttach>,
+    /// What each attachment placeholder this box inserted stands for, in the order
+    /// they went in (see [`Attachment`]).
+    ///
+    /// SCOPED TO ONE COMPOSE, exactly like [`model`](Self::model): born empty with
+    /// every [`ComposeState::new`] and dead with the compose (`App::close_compose`);
+    /// nothing global holds it and nothing on disk learns it. Written only by
+    /// [`finish_attach`]; read only by [`draft`], which expands each placeholder
+    /// still in the text ([`expand_attachments`]). An entry whose placeholder has
+    /// left the text sends nothing.
+    pub attachments: Vec<Attachment>,
+}
+
+/// One attachment of a compose box: the file an attachment placeholder in its
+/// draft stands for. It stores only what varies; the placeholder is derived
+/// through the ONE formatter ([`Attachment::placeholder`]), so what the draft shows
+/// and what [`expand_attachments`] looks for cannot drift apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    /// An image saved in the paste cache, or a copied file.
+    pub kind: AttachmentKind,
+    /// The absolute path its mention names, accepted by `file_mention` when it was
+    /// attached.
+    pub path: PathBuf,
+    /// Its number, unique for the board session ([`App::attachment_number`]).
+    pub number: u64,
+}
+
+impl Attachment {
+    /// The attachment placeholder the draft shows for it
+    /// ([`attachment_placeholder`]).
+    pub fn placeholder(&self) -> String {
+        attachment_placeholder(self.kind, &self.path, self.number)
+    }
+}
+
+/// One clipboard read a compose is waiting on. The `token` ties the worker's
+/// `AppEvent::ClipboardRead` to THIS compose: a result for a compose that was
+/// cancelled or replaced carries a token nobody holds and is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingAttach {
+    /// The request id ([`App::attach_token`]).
+    pub token: u64,
+    /// Whether the driver has been handed this request ([`take_clipboard_read`]).
+    pub requested: bool,
+    /// Why the read was asked for.
+    pub purpose: AttachPurpose,
+}
+
+impl PendingAttach {
+    /// Whether the box shows its `attaching…` mark: only for a read the user asked
+    /// for, never for the silent file-paste check.
+    pub fn shows_mark(&self) -> bool {
+        self.purpose == AttachPurpose::Explicit
+    }
+}
+
+/// Why a clipboard read was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachPurpose {
+    /// `Ctrl-V`, or an empty paste: attach whatever the clipboard holds.
+    Explicit,
+    /// A paste that looked like copied files: when the clipboard confirms it holds
+    /// those files, the verbatim text becomes their attachment placeholders.
+    Upgrade {
+        /// The text that was inserted.
+        inserted: String,
+        /// The buffer's lines right after the insert.
+        lines_after: Vec<String>,
+        /// The caret right after the insert.
+        cursor_after: (usize, usize),
+    },
 }
 
 /// The compose pick list of any compose box: what is showing, plus the per-draft
@@ -250,6 +420,13 @@ struct SourceView<'a> {
 }
 
 impl CompletionState {
+    /// No token, so no list and nothing remembered about a closed one.
+    fn close(&mut self) {
+        self.context = None;
+        self.dismissed = None;
+        self.visible = None;
+    }
+
     /// Recompute the list for the caret at `cursor` in `lines`. `source` is what
     /// this draft's list reads from ([`completion_source`]), or `None` for a reply
     /// or fork whose session left the store, which shows no list.
@@ -288,9 +465,7 @@ impl CompletionState {
             return;
         };
         let Some(ctx) = completion_context(lines, cursor) else {
-            self.context = None;
-            self.dismissed = None;
-            self.visible = None;
+            self.close();
             return;
         };
         let key = (ctx.trigger, ctx.row, ctx.start);
@@ -421,6 +596,8 @@ impl ComposeState {
             textarea,
             model: None,
             completion: CompletionState::default(),
+            pending_attach: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -537,7 +714,8 @@ pub enum ComposeAction {
     Newline,
     /// Forward the keystroke to the text editor (ordinary typing / editing).
     Forward,
-    /// Cancel compose and return to the board (`Esc`).
+    /// Cancel (`Esc`): the box's own explicit attach while one is reading, keeping
+    /// the draft ([`esc_cancels_attach`]), else the compose, back to the board.
     Cancel,
     /// Run the draft INTERACTIVELY instead of in the background (`Ctrl-O`).
     ///
@@ -547,8 +725,17 @@ pub enum ComposeAction {
     /// stays target-free here so the pure router remains a plain key → intent map;
     /// [`handle_compose_key`] is where the target decides whether the intent is
     /// actionable. `Ctrl-O` is unbound in `ratatui_textarea`, so claiming it costs
-    /// the reply editor nothing it previously did.
+    /// the reply editor nothing it previously did. Like `Enter`, it waits while the
+    /// box's own explicit attach is reading ([`submit_waits_for_attach`]).
     OpenInteractive,
+    /// Attach what the OS clipboard holds (`Ctrl-V`): copied files, else an image,
+    /// each as an attachment placeholder in the draft, sent as its `@"<path>"`
+    /// mention ([`expand_attachments`]). Every target acts on it.
+    ///
+    /// Claims `Ctrl-V` from `ratatui-textarea`'s page-down on purpose: a draft keeps
+    /// `PgDn` for its editor and a reply's or fork's `PgDn` scrolls the preview.
+    /// Text paste stays the terminal's own bracketed paste.
+    AttachClipboard,
     /// Open the model picker for THIS compose (`Ctrl-L`) — every target acts on it,
     /// since a reply, a fork and a draft each carry their own pick
     /// ([`ComposeState::model`]).
@@ -633,13 +820,18 @@ pub enum ComposeAction {
 ///   interactive run; inert on a reply — see [`ComposeAction::OpenInteractive`]).
 /// * `Ctrl-L` → **PickModel** (this compose's model picker, on every target — see
 ///   [`ComposeAction::PickModel`] for why the key is free).
+/// * `Ctrl-V` → **AttachClipboard** (copied files, else an image, as attachment
+///   placeholders sent as `@"<path>"` mentions; every target). It shadows
+///   `ratatui-textarea`'s `Ctrl-V` page-down: a draft keeps `PgDn` for its
+///   editor, a reply's or fork's `PgDn` scrolls the preview.
 /// * `Ctrl-T` / `Ctrl-E` / `Home` / `End` → **PreviewTop** / **PreviewBottom**,
 ///   `PgUp` / `PgDn` → **PreviewPageUp** / **PreviewPageDown**, `Ctrl-U` / `Ctrl-D`
 ///   → **PreviewHalfUp** / **PreviewHalfDown**: exactly the board's transcript
 ///   scroll keys (`update::key_to_action` — the `Ctrl` letters whatever else is
 ///   held, the named keys only WITHOUT `Ctrl`). A reply or fork acts on them, a
 ///   draft forwards them to the editor.
-/// * `Esc` → **Cancel** (dismiss compose, not the app).
+/// * `Esc` → **Cancel** (the box's explicit attach first, if one is reading, then
+///   the compose; never the app — see [`esc_cancels_attach`]).
 /// * everything else → **Forward** to the editor.
 ///
 /// While the `/` / `@` pick list is showing (`list_open`), and only then, the keys
@@ -659,6 +851,7 @@ pub fn compose_key_to_action(key: KeyEvent, list_open: bool) -> ComposeAction {
         // full argument is on `ComposeAction::PickModel`. Both cases, for the kitty
         // path's sake, like the arms above.
         KeyCode::Char('l' | 'L') if ctrl => ComposeAction::PickModel,
+        KeyCode::Char('v' | 'V') if ctrl => ComposeAction::AttachClipboard,
         KeyCode::Char('t' | 'T') if ctrl => ComposeAction::PreviewTop,
         KeyCode::Char('e' | 'E') if ctrl => ComposeAction::PreviewBottom,
         KeyCode::Char('u' | 'U') if ctrl => ComposeAction::PreviewHalfUp,
@@ -723,12 +916,15 @@ pub fn open_background(app: &mut App, agent: Option<String>) {
 /// Apply one keypress while the compose zone owns the keyboard.
 ///
 /// Newline inserts into the editor; Forward hands the keystroke to the editor's
-/// FULL key handler ([`TextArea::input`]); Cancel clears the compose state; Send
-/// resolves the buffer through [`submit_compose`] (a reply send, or a background
-/// launch); OpenInteractive escalates a background draft to the interactive
-/// hand-off; and PickModel opens the model picker over this compose
-/// (`App::open_model_picker`), which leaves the draft — text and pick alike —
-/// exactly as it was until the picker's `Enter` writes a new pick into it.
+/// FULL key handler ([`TextArea::input`]); Cancel drops the box's own explicit
+/// attach while one is reading ([`esc_cancels_attach`]), else clears the compose
+/// state; Send resolves the buffer through [`submit_compose`] (a reply send, a
+/// headless fork, or a background launch); OpenInteractive escalates a background
+/// draft or a fork to the interactive hand-off ([`open_interactive`]); both wait
+/// while the box's own attach is still reading ([`submit_waits_for_attach`]); and
+/// PickModel opens the model picker over this compose (`App::open_model_picker`),
+/// which leaves the draft — text and pick alike — exactly as it was until the
+/// picker's `Enter` writes a new pick into it.
 ///
 /// Forward uses `input` (not `input_without_shortcuts`) so arrows/Home/End actually
 /// MOVE the caret and word-delete works — `input_without_shortcuts` handles only
@@ -787,12 +983,28 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
             Outcome::Continue
         }
         ComposeAction::Cancel => {
+            let pending = app.compose.as_ref().and_then(|c| c.pending_attach.as_ref());
+            if esc_cancels_attach(pending) {
+                // The read's late result now carries a token nobody holds.
+                if let Some(compose) = app.compose.as_mut() {
+                    compose.pending_attach = None;
+                }
+                app.set_status_transient(ATTACH_CANCELLED_HINT);
+                return Outcome::Continue;
+            }
             // Esc drops the editor AND the draft card together — one teardown, so a
             // cancelled draft can never leave a placeholder pane behind.
             app.close_compose();
             Outcome::Continue
         }
-        ComposeAction::Send => submit_compose(app),
+        ComposeAction::Send => {
+            let pending = app.compose.as_ref().and_then(|c| c.pending_attach.as_ref());
+            if submit_waits_for_attach(pending) {
+                app.set_status_transient(ENTER_WHILE_ATTACHING_HINT);
+                return Outcome::Continue;
+            }
+            submit_compose(app)
+        }
         ComposeAction::OpenInteractive => open_interactive(app),
         // The transcript a reply or fork box previews is the SELECTED row's, which
         // is the box's target (STABLE-ID STATE: nothing here moves the selection),
@@ -813,6 +1025,10 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
                 if let Some(compose) = app.compose.as_mut() {
                     compose.textarea.input(key);
                 }
+                // The key moved the caret or edited the text (`Home`, `Ctrl-U`, …),
+                // so an open list was computed for a token that is no longer there:
+                // a pick would delete the query's length at the NEW caret.
+                refresh_completion(app);
             } else {
                 // The board's own methods, so follow-bottom behaves identically.
                 match scroll {
@@ -824,6 +1040,10 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
                     _ => app.preview_half_down(),
                 }
             }
+            Outcome::Continue
+        }
+        ComposeAction::AttachClipboard => {
+            request_attach(app, AttachPurpose::Explicit, true);
             Outcome::Continue
         }
         ComposeAction::PickModel => {
@@ -848,15 +1068,483 @@ pub fn handle_compose_key(app: &mut App, key: KeyEvent) -> Outcome {
 /// There is deliberately no [`Outcome`] here. Every compose exit
 /// (Send / OpenInteractive / Cancel) is reachable only from
 /// [`compose_key_to_action`], so a paste STRUCTURALLY cannot submit, launch, or
-/// close the draft — it can only edit the buffer. `text` is already normalized and
-/// capped by `update::accept_paste`; a no-op on an empty string, and on a paste that
-/// arrives with no draft open (the caller checks, but the `if let` keeps this total).
+/// close the draft. It edits the buffer, and a paste shaped like a copied file's
+/// rendering ([`paste_may_name_files`]) ALSO requests a silent clipboard read, whose
+/// result may later replace the pasted text with attachment placeholders
+/// ([`finish_attach`]).
+/// `text` is already normalized and capped by `update::accept_paste`; a no-op on an
+/// empty string, and on a paste that arrives with no draft open (the caller checks,
+/// but the `if let` keeps this total).
 pub fn insert_paste(app: &mut App, text: &str) {
     if let Some(compose) = app.compose.as_mut() {
         compose.textarea.insert_str(text);
     }
     // A pasted `/` or `@` opens the list like a typed one; still no `Outcome`.
     refresh_completion(app);
+    // Cmd+V of a copied file pastes its path or name as text. Ask the clipboard
+    // whether it holds those files; the verbatim text stays unless it does.
+    if paste_may_name_files(text) {
+        if let Some(compose) = app.compose.as_ref() {
+            let purpose = AttachPurpose::Upgrade {
+                inserted: text.to_string(),
+                lines_after: compose.textarea.lines().to_vec(),
+                cursor_after: cursor_pos(&compose.textarea),
+            };
+            request_attach(app, purpose, false);
+        }
+    }
+}
+
+/// Start a clipboard read for the open compose. Does not spawn: the driver does,
+/// after [`take_clipboard_read`] hands it the token. With a read already pending,
+/// `nudge` says whether to tell the user (an explicit key) or stay silent (a paste
+/// whose upgrade check is simply skipped). No-op with no compose open.
+pub(crate) fn request_attach(app: &mut App, purpose: AttachPurpose, nudge: bool) {
+    let Some(compose) = app.compose.as_ref() else {
+        return;
+    };
+    // A silent upgrade check shows no mark and must not block the user's own
+    // `Ctrl-V`: an explicit request takes over, and the check's result, carrying a
+    // token nobody holds any more, is dropped.
+    let silent_upgrade = matches!(
+        compose.pending_attach.as_ref().map(|p| &p.purpose),
+        Some(AttachPurpose::Upgrade { .. })
+    );
+    let supersedes = silent_upgrade && purpose == AttachPurpose::Explicit;
+    if compose.pending_attach.is_some() && !supersedes {
+        if nudge {
+            app.set_status_transient(ATTACH_BUSY_HINT);
+        }
+        return;
+    }
+    app.attach_token = app.attach_token.wrapping_add(1);
+    let token = app.attach_token;
+    if let Some(compose) = app.compose.as_mut() {
+        compose.pending_attach = Some(PendingAttach {
+            token,
+            requested: false,
+            purpose,
+        });
+    }
+}
+
+/// The token and [`ReadMode`] of a clipboard read the driver should start now, if
+/// any: `tui::run_inner` asks after every handled event and spawns on an answer,
+/// so the decision stays here, pure and tested, and no key handler ever spawns.
+/// Returns a pending, un-requested attach ONCE and marks it requested. An
+/// `Upgrade` is `ListOnly`: only an explicit attach may save an image.
+pub(crate) fn take_clipboard_read(app: &mut App) -> Option<(u64, ReadMode)> {
+    let pending = app.compose.as_mut()?.pending_attach.as_mut()?;
+    if pending.requested {
+        return None;
+    }
+    pending.requested = true;
+    let mode = match pending.purpose {
+        AttachPurpose::Explicit => ReadMode::Attach,
+        AttachPurpose::Upgrade { .. } => ReadMode::ListOnly,
+    };
+    Some((pending.token, mode))
+}
+
+/// The saved images of the clipboard results [`finish_attach`] dropped, for the
+/// driver to delete now, each handed over ONCE: `tui::run_inner` asks after every
+/// handled event and gives a non-empty answer to
+/// `clipboard::spawn_paste_image_discard`, so nothing is deleted on the UI thread
+/// and no handler spawns.
+pub(crate) fn take_stale_paste_images(app: &mut App) -> Vec<PathBuf> {
+    std::mem::take(&mut app.stale_paste_images)
+}
+
+/// Whether a submit — `Enter`, or the fork box's and the draft's `Ctrl-O` run —
+/// must wait for the box's `pending` attach. PURE. Only an EXPLICIT read holds it
+/// (`Ctrl-V`, or an empty paste: exactly the read whose `attaching…` mark is
+/// showing), since leaving then would drop the attachment the user just asked for.
+/// The silent copied-file check never does: its paste is already in the draft as
+/// text, and its late result is dropped by the token rule.
+pub(crate) fn submit_waits_for_attach(pending: Option<&PendingAttach>) -> bool {
+    pending.is_some_and(PendingAttach::shows_mark)
+}
+
+/// Whether `Esc`, with the pick list closed, cancels the box's `pending` attach
+/// and keeps the box. PURE. True for exactly the read [`submit_waits_for_attach`]
+/// holds `Enter` and `Ctrl-O` for, so every read that holds the box has a key that
+/// releases it: on Linux a hung clipboard owner keeps it for the read's whole
+/// timeout. The silent copied-file check is no attach to cancel; `Esc` then
+/// cancels the box. An open pick list is closed first, before this is asked
+/// ([`compose_key_to_action`]).
+pub(crate) fn esc_cancels_attach(pending: Option<&PendingAttach>) -> bool {
+    submit_waits_for_attach(pending)
+}
+
+/// Whether a paste is worth asking the clipboard about. PURE. It is ONE line of at
+/// most [`PASTE_FILE_NAMES_MAX_CHARS`], shaped like a rendering
+/// [`paste_names_files`] matches:
+///
+/// * a path rendering: it starts with one of [`PASTE_PATH_PREFIXES`]; or
+/// * bare file names: no `/`, and EVERY whitespace-separated word a file name
+///   ([`looks_like_file_name`]);
+///
+/// and it names no URI scheme but `file`: no other `<scheme>://` anywhere
+/// ([`holds_non_file_url`]), and no word opening with another `<scheme>:`
+/// ([`opens_with_non_file_scheme`]).
+///
+/// So a URL, a `mailto:`, a relative `a/b`, a version (`v1.2`), a number (`3.14`)
+/// and prose never ask. The shape is not exact, and DOMAIN.md (Compose attach)
+/// states both ways it misses: some text still asks (`/compact`, a bare `/`,
+/// `example.com`, `a@b.com`, `node.js`), and some copied files' pastes never do
+/// (a bare name holding a space or lacking a lettered extension, a path or name
+/// holding another scheme). A false positive costs one child read and nothing
+/// else, since the upgrade also needs [`paste_names_files`] to hold.
+pub(crate) fn paste_may_name_files(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.contains('\n') || t.chars().count() > PASTE_FILE_NAMES_MAX_CHARS {
+        return false;
+    }
+    if holds_non_file_url(t) || t.split_whitespace().any(opens_with_non_file_scheme) {
+        return false;
+    }
+    PASTE_PATH_PREFIXES
+        .iter()
+        .any(|prefix| t.starts_with(prefix))
+        || (!t.contains('/') && t.split_whitespace().all(looks_like_file_name))
+}
+
+/// Whether one whitespace-free `word` reads as a file name: a stem, then an
+/// extension of at most [`FILE_EXTENSION_MAX_CHARS`] alphanumerics holding at least
+/// one letter, so `report.pdf` and `shot.mp4` do and `v1.2` and `3.14` do not.
+fn looks_like_file_name(word: &str) -> bool {
+    word.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty()
+            && ext.chars().count() <= FILE_EXTENSION_MAX_CHARS
+            && ext.chars().all(char::is_alphanumeric)
+            && ext.chars().any(char::is_alphabetic)
+    })
+}
+
+/// Whether `text` holds, anywhere, a `<scheme>://` whose scheme is not `file`.
+/// The scheme is the WHOLE run of scheme characters before the `://`, from its
+/// first letter (RFC 3986 §3.1), so `xfile://` is not `file://`.
+fn holds_non_file_url(text: &str) -> bool {
+    text.match_indices(URI_AUTHORITY_MARK).any(|(at, _)| {
+        let before = &text[..at];
+        let run = &before[before.trim_end_matches(is_uri_scheme_char).len()..];
+        let scheme = run.trim_start_matches(|c: char| !c.is_ascii_alphabetic());
+        !scheme.is_empty() && !is_file_scheme(scheme)
+    })
+}
+
+/// Whether one whitespace-free `word` opens with `<scheme>:` for a scheme other
+/// than `file` (`mailto:a@b.com`, a bare `http:`). A colon inside a path
+/// (`/a/b:c.png`) opens nothing.
+fn opens_with_non_file_scheme(word: &str) -> bool {
+    word.split_once(':')
+        .is_some_and(|(scheme, _)| is_uri_scheme(scheme) && !is_file_scheme(scheme))
+}
+
+/// Whether `s` is an RFC 3986 §3.1 scheme: a letter, then scheme characters.
+fn is_uri_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.all(is_uri_scheme_char)
+}
+
+/// Whether `c` may follow a scheme's first letter (RFC 3986 §3.1).
+fn is_uri_scheme_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
+}
+
+/// Whether `scheme` is [`FILE_URI_SCHEME`]'s, the one [`paste_names_files`]
+/// matches. Compared exactly, as every `file://` match here and in `clipboard` is.
+fn is_file_scheme(scheme: &str) -> bool {
+    FILE_URI_SCHEME.strip_suffix(URI_AUTHORITY_MARK) == Some(scheme)
+}
+
+/// Whether `pasted` is one terminal rendering of `files`, the files the clipboard
+/// holds. An unknown rendering is `false`, so the paste stays verbatim.
+///
+/// Renderings, each read from the terminal's source (2026-10-06, not tested live):
+/// the first path raw (VS Code / xterm.js pastes the first file's `fsPath`); all
+/// paths joined by a space; backslash-escaped paths joined by a space (iTerm2
+/// `stringFromPasteboard`; compared unescaped, so the escape set need not be
+/// mirrored); paths in single or double quotes; `file://` URIs, raw or
+/// percent-encoded; base names joined by a space (terminals that paste names only).
+/// No newline-joined rendering: [`paste_may_name_files`] asks only about one line,
+/// so a paste of files on separate lines stays text, and `Ctrl-V` attaches them.
+/// That gate keeps some one-line renderings from ever reaching here too, so they
+/// stay text: a bare name holding a space or lacking a lettered extension, and any
+/// rendering naming a URI scheme other than `file` (DOMAIN.md, Compose attach).
+pub(crate) fn paste_names_files(pasted: &str, files: &[PathBuf]) -> bool {
+    let pasted = pasted.trim();
+    let paths: Vec<&str> = files.iter().filter_map(|p| p.to_str()).collect();
+    if pasted.is_empty() || paths.is_empty() || paths.len() != files.len() {
+        return false;
+    }
+    let names: Vec<&str> = files
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .collect();
+    let spaced = paths.join(" ");
+    let wrapped = |q: &str| {
+        paths
+            .iter()
+            .map(|p| format!("{q}{p}{q}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let uris = paths
+        .iter()
+        .map(|p| format!("{FILE_URI_SCHEME}{p}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let unescaped = unescape_backslashes(pasted);
+    let decoded = super::clipboard::percent_decode(pasted);
+    pasted == paths[0]
+        || pasted == spaced
+        || unescaped == spaced
+        || pasted == wrapped("'")
+        || pasted == wrapped("\"")
+        || pasted == uris
+        || decoded.as_deref() == Some(uris.as_str())
+        || (names.len() == files.len() && pasted == names.join(" "))
+}
+
+/// `s` with each backslash dropped and the character it escaped kept.
+fn unescape_backslashes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// What an explicit attach says for a result that attaches nothing, as a sticky
+/// refusal; `None` for the results that carry a path, which [`finish_attach`]
+/// attaches or names in its own refusal.
+fn attach_refusal(result: &ClipboardAttach) -> Option<&'static str> {
+    match result {
+        ClipboardAttach::Files(_)
+        | ClipboardAttach::Image(_)
+        | ClipboardAttach::Unmentionable(_) => None,
+        ClipboardAttach::TextOnly => Some(ATTACH_TEXT_ONLY),
+        ClipboardAttach::Nothing => Some(ATTACH_NOTHING),
+        ClipboardAttach::UnsupportedImage => Some(ATTACH_UNSUPPORTED_IMAGE),
+        ClipboardAttach::TooLarge => Some(ATTACH_TOO_LARGE),
+        ClipboardAttach::RemoteSession => Some(ATTACH_REMOTE),
+        ClipboardAttach::NoDisplay => Some(ATTACH_NO_DISPLAY),
+        ClipboardAttach::NoTool => Some(ATTACH_NO_TOOL),
+        ClipboardAttach::Failed => Some(ATTACH_FAILED),
+    }
+}
+
+/// The paths of `paths` a mention can carry, in order, and every path none can,
+/// with its cause. Asked when a read lands, so a refused path never gets an
+/// attachment placeholder.
+fn split_mentionable(paths: &[PathBuf]) -> (Vec<&Path>, Vec<(&Path, MentionRefusal)>) {
+    let mut accepted = Vec::new();
+    let mut refused = Vec::new();
+    for path in paths {
+        match file_mention(path) {
+            Ok(_) => accepted.push(path.as_path()),
+            Err(why) => refused.push((path.as_path(), why)),
+        }
+    }
+    (accepted, refused)
+}
+
+/// The text a status line holds for a path: quoted and escaped as `Path`'s
+/// `Debug` escapes a string, so two files of one name stay apart and a line break
+/// cannot split the line. The rule and its source: DOMAIN.md, "The confirmation".
+/// The ONE way a path reaches the compose attach's status lines:
+/// [`refusal_status`] and [`attached_status`].
+fn shown_path(path: &Path) -> String {
+    format!("{path:?}")
+}
+
+/// ONE status line naming every path of `refused` with its cause, led by
+/// `prefix`, each path as [`shown_path`] shows it.
+fn refusal_status(prefix: &str, refused: &[(&Path, MentionRefusal)]) -> String {
+    let named: Vec<String> = refused
+        .iter()
+        .map(|(path, why)| {
+            format!(
+                "{}{ATTACH_REFUSED_CAUSE_SEPARATOR}{}",
+                shown_path(path),
+                why.describe()
+            )
+        })
+        .collect();
+    format!("{prefix}{}", named.join(ATTACH_REFUSED_SEPARATOR))
+}
+
+/// Apply a finished clipboard read to the open compose: the handler of
+/// `AppEvent::ClipboardRead`.
+///
+/// Dropped unless a compose is open AND its pending attach holds `token`; a
+/// dropped result records no attachment and takes no number, and a dropped
+/// `Image`'s path is queued for the driver to delete ([`take_stale_paste_images`]),
+/// since no draft holds it. An `Explicit` read inserts at the caret an attachment
+/// placeholder for each path a mention can carry, recording each on the box
+/// ([`ComposeState::attachments`]) under the next board-wide number
+/// ([`App::attachment_number`]), and sets a sticky refusal naming every path it
+/// could not carry, or naming why nothing was attached, leaving the draft
+/// byte-identical. An `Upgrade` read replaces the pasted text with a placeholder
+/// for EVERY one of its files only when the clipboard holds exactly the files it
+/// names, the draft has not moved since, and every one of those files can be
+/// mentioned. A file no mention can carry keeps the paste as it is, buffer and
+/// caret, under a sticky refusal naming every such file; any other outcome keeps it
+/// and says nothing, since it was an ordinary paste. Copied files that DO attach
+/// are confirmed with their full path ([`confirm_attached`]); an image is not.
+pub(crate) fn finish_attach(app: &mut App, token: u64, result: ClipboardAttach) {
+    let holds_token = |c: &ComposeState| c.pending_attach.as_ref().map(|p| p.token) == Some(token);
+    let Some(compose) = app.compose.as_mut().filter(|c| holds_token(c)) else {
+        // `Unmentionable` wrote no file, and `Files` are the user's own.
+        if let ClipboardAttach::Image(path) = result {
+            app.stale_paste_images.push(path);
+        }
+        return;
+    };
+    let Some(PendingAttach { purpose, .. }) = compose.pending_attach.take() else {
+        return;
+    };
+    // An upgrade goes on only when the clipboard holds the very files the paste
+    // named and the draft has not moved; otherwise it was an ordinary paste, and
+    // nothing is said.
+    if let AttachPurpose::Upgrade {
+        inserted,
+        lines_after,
+        cursor_after,
+    } = &purpose
+    {
+        let ClipboardAttach::Files(files) = &result else {
+            return;
+        };
+        let unchanged = compose.textarea.lines() == lines_after.as_slice()
+            && cursor_pos(&compose.textarea) == *cursor_after;
+        if !unchanged || !paste_names_files(inserted, files) {
+            return;
+        }
+    }
+    let (kind, paths) = match &result {
+        ClipboardAttach::Files(files) => (AttachmentKind::File, files.clone()),
+        // `clipboard::save_image` returns `Unmentionable` only for a path the same
+        // `file_mention` refused, so it lands in `refused` below, never in an
+        // attachment.
+        ClipboardAttach::Image(path) | ClipboardAttach::Unmentionable(path) => {
+            (AttachmentKind::Image, vec![path.clone()])
+        }
+        other => {
+            // A refusal sticks until the next keypress, like every failure.
+            if let Some(msg) = attach_refusal(other) {
+                app.set_status(msg);
+            }
+            return;
+        }
+    };
+    let (accepted, refused) = split_mentionable(&paths);
+    match &purpose {
+        AttachPurpose::Upgrade { inserted, .. } => {
+            // Whole or not at all: swapping in only the accepted placeholders would
+            // delete the refused files' pasted text from the draft.
+            if !refused.is_empty() {
+                app.set_status(refusal_status(PASTE_KEPT_PREFIX, &refused));
+                return;
+            }
+            if let Some(compose) = app.compose.as_mut() {
+                let back = inserted.chars().count();
+                for _ in 0..back {
+                    compose.textarea.move_cursor(CursorMove::Back);
+                }
+                compose.textarea.delete_str(back);
+                let placeholders =
+                    record_attachments(compose, &mut app.attachment_number, kind, &accepted);
+                insert_placeholders(compose, &placeholders);
+            }
+            confirm_attached(app, kind, &accepted);
+        }
+        AttachPurpose::Explicit => {
+            if !accepted.is_empty() {
+                if let Some(compose) = app.compose.as_mut() {
+                    let placeholders =
+                        record_attachments(compose, &mut app.attachment_number, kind, &accepted);
+                    insert_placeholders(compose, &placeholders);
+                }
+            }
+            if !refused.is_empty() {
+                app.set_status(refusal_status(ATTACH_REFUSED_PREFIX, &refused));
+            }
+            confirm_attached(app, kind, &accepted);
+        }
+    }
+    refresh_completion(app);
+}
+
+/// The confirmation of copied files attached: `attached <first path>` with the
+/// path as [`shown_path`] shows it (quoted, escaped), plus ` (+N more)` when there
+/// are others. PURE; `None` for no file. A path here passed [`file_mention`].
+fn attached_status(accepted: &[&Path]) -> Option<String> {
+    let (first, rest) = accepted.split_first()?;
+    let more = if rest.is_empty() {
+        String::new()
+    } else {
+        format!("{ATTACHED_MORE_OPEN}{}{ATTACHED_MORE_CLOSE}", rest.len())
+    };
+    Some(format!("{ATTACHED_PREFIX}{}{more}", shown_path(first)))
+}
+
+/// Confirm copied files attached on the status line, unless something already
+/// owns it. Only a COPIED FILE is confirmed (a screenshot's cache path means
+/// nothing to the user), and never over a refusal, which is sticky where this note
+/// is transient: a caller sets its own refusal BEFORE asking, and one a result set
+/// while the clipboard read ran is already there.
+fn confirm_attached(app: &mut App, kind: AttachmentKind, accepted: &[&Path]) {
+    if kind != AttachmentKind::File || app.has_sticky_status() {
+        return;
+    }
+    if let Some(msg) = attached_status(accepted) {
+        app.set_status_transient(msg);
+    }
+}
+
+/// Record one [`Attachment`] of `kind` on `compose` for each of `paths`, in order,
+/// each under the next number of `last_number` (`App::attachment_number`, passed
+/// as the disjoint field it is), and return their placeholders in that order.
+fn record_attachments(
+    compose: &mut ComposeState,
+    last_number: &mut u64,
+    kind: AttachmentKind,
+    paths: &[&Path],
+) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            *last_number = last_number.wrapping_add(1);
+            let attachment = Attachment {
+                kind,
+                path: path.to_path_buf(),
+                number: *last_number,
+            };
+            let placeholder = attachment.placeholder();
+            compose.attachments.push(attachment);
+            placeholder
+        })
+        .collect()
+}
+
+/// Insert `placeholders` at the caret, spaced per [`mention_insert_text`].
+fn insert_placeholders(compose: &mut ComposeState, placeholders: &[String]) {
+    let (row, col) = cursor_pos(&compose.textarea);
+    let before = col
+        .checked_sub(1)
+        .and_then(|i| compose.textarea.lines().get(row)?.chars().nth(i));
+    compose
+        .textarea
+        .insert_str(mention_insert_text(before, placeholders));
 }
 
 /// Recompute the open draft's pick list from its editor, reply, fork and
@@ -869,6 +1557,9 @@ pub fn insert_paste(app: &mut App, text: &str) {
 /// per folder on every target) run from the key and paste handlers and from
 /// `update::dispatch`'s `CatalogFetched` arm — which calls this so a catalog that
 /// lands mid-draft reaches an open list — and never from the render path.
+///
+/// A token that overlaps an attachment placeholder closes the list before any of
+/// those reads ([`token_overlaps_placeholder`]).
 ///
 /// Only the source's two paths are cloned out (clone-then-mutate); the catalog is
 /// BORROWED, `app.catalogs` beside `app.compose` as disjoint fields, so no list is
@@ -887,11 +1578,106 @@ pub(crate) fn refresh_completion(app: &mut App) {
         transcript: s.transcript.as_deref(),
         catalog,
     });
-    compose.completion.refresh(
-        compose.textarea.lines(),
-        cursor_pos(&compose.textarea),
-        view,
-    );
+    let lines = compose.textarea.lines();
+    let cursor = cursor_pos(&compose.textarea);
+    if token_overlaps_placeholder(lines, cursor, &compose.attachments) {
+        compose.completion.close();
+        return;
+    }
+    compose.completion.refresh(lines, cursor, view);
+}
+
+/// Whether the token [`completion_context`] reads at the caret OVERLAPS the span
+/// of a placeholder some entry of `attachments` derives: it starts inside it, ends
+/// inside it, or holds all of it. The pick list never reads a placeholder, so it
+/// opens on no such token: a pick would write into the placeholder and break it.
+/// Whitespace ends a token, yet a token can still reach into a placeholder: a
+/// file name holding two spaces in a row (`[a  b.pdf #1]`) lets an `@` typed
+/// between them read as a token of its own, and an `@` typed inside a name and
+/// walked to the name's end reads as one made of typed characters and the name's.
+///
+/// Pure, over the editor's lines and the box's attachments; it asks
+/// [`completion_context`] and reads no placeholder shape of its own, only the ones
+/// [`Attachment::placeholder`] derives, through [`overlaps_placeholder`].
+fn token_overlaps_placeholder(
+    lines: &[String],
+    cursor: (usize, usize),
+    attachments: &[Attachment],
+) -> bool {
+    let Some(ctx) = completion_context(lines, cursor) else {
+        return false;
+    };
+    let Some(line) = lines.get(ctx.row) else {
+        return false;
+    };
+    let line: Vec<char> = line.chars().collect();
+    attachments.iter().any(|attachment| {
+        let placeholder: Vec<char> = attachment.placeholder().chars().collect();
+        overlaps_placeholder(&line, ctx.start..cursor.1, &placeholder)
+    })
+}
+
+/// Whether the characters `token` (a range of `line`) overlap the span of
+/// `placeholder` in `line`.
+///
+/// WHERE A PLACEHOLDER'S SPAN IS once typing has broken its text: characters
+/// typed into a placeholder are only ever in the token being typed, so the span
+/// is found by setting aside any of the TOKEN's own characters, none, some or all,
+/// and asking whether the placeholder then stands whole: its first and last
+/// characters present, every other character of it in order, every character
+/// outside the token matching exactly and in place. Its span is then from its
+/// first matched character to its last, set-aside characters between them
+/// included. The token overlaps it when it holds a matched character, or when
+/// every character of it was set aside strictly inside the span (typed between
+/// the placeholder's own characters, as an `@` between two spaces of a name).
+///
+/// That covers a token typed wholly inside, one holding typed characters AND some
+/// of the placeholder's own (`@report.pdf` in `[my @report.pdf #1]`), one that
+/// starts before the placeholder and ends inside it, one that starts inside it and
+/// ends past it, and one that holds all of it. A token that only ABUTS it (ends
+/// where the span starts, or starts where it ends) overlaps nothing, and a
+/// placeholder that characters OUTSIDE the token have already broken is plain text
+/// with no span: it is no longer in the draft ([`expand_attachments`] sends nothing
+/// for it).
+///
+/// Pure over characters; costs at most the placeholder's length squared plus one
+/// pass over the token for each PAIR of a prefix and a suffix of the placeholder
+/// that the line really holds around the token (few of each).
+fn overlaps_placeholder(line: &[char], token: Range<usize>, placeholder: &[char]) -> bool {
+    let n = placeholder.len();
+    if n == 0 || token.is_empty() || token.end > line.len() {
+        return false;
+    }
+    let (start, end) = (token.start, token.end);
+    // How much of the placeholder stands in `line` right before and right after
+    // the token, character for character.
+    let before = (0..=n.min(start)).filter(|&x| placeholder[..x] == line[start - x..start]);
+    let after: Vec<usize> = (0..=n.min(line.len() - end))
+        .filter(|&y| placeholder[n - y..] == line[end..end + y])
+        .collect();
+    before.into_iter().any(|x| {
+        after.iter().any(|&y| {
+            let middle = placeholder.get(x..n - y);
+            match middle {
+                // The token sits between two stretches of the placeholder.
+                Some([]) => x > 0 && y > 0,
+                Some(middle) => is_subsequence(middle, &line[start..end]),
+                None => false,
+            }
+        })
+    })
+}
+
+/// Whether `needle` occurs in `hay` in order, not necessarily next to each other.
+fn is_subsequence(needle: &[char], hay: &[char]) -> bool {
+    let mut rest = needle.iter();
+    let mut want = rest.next();
+    for c in hay {
+        if want == Some(c) {
+            want = rest.next();
+        }
+    }
+    want.is_none()
 }
 
 /// The folder whose catalog the driver should fetch now, if any: `tui::run_inner`
@@ -965,12 +1751,14 @@ fn accept_completion(compose: &mut ComposeState) {
     compose.textarea.insert_str(text);
 }
 
-/// The open draft as its submit paths need it: the text, what it is addressed to,
-/// and the model picked for it (`None` = its default, no `--model`). Cloned out so
-/// the borrow of the app ends before anything mutates it — the clone-then-mutate
-/// discipline every other handler here follows.
+/// The open draft as its submit paths need it: the message to send, what it is
+/// addressed to, and the model picked for it (`None` = its default, no
+/// `--model`). Cloned out so the borrow of the app ends before anything mutates it
+/// — the clone-then-mutate discipline every other handler here follows.
 struct Draft {
-    /// The editor buffer, lines joined with `\n`.
+    /// The editor buffer, lines joined with `\n`, with each attachment placeholder
+    /// still in it expanded into its `@"<absolute path>"` mention
+    /// ([`expand_attachments`]).
     message: String,
     /// What the draft is addressed to.
     target: ComposeTarget,
@@ -983,11 +1771,13 @@ struct Draft {
     carried_effort: Option<&'static str>,
 }
 
-/// Read the open draft out of the app (see [`Draft`]).
+/// Read the open draft out of the app (see [`Draft`]). The one reader every
+/// submit goes through — [`submit_compose`] and [`open_interactive`] — and so the
+/// ONE place an attachment placeholder becomes a mention.
 fn draft(app: &App) -> Option<Draft> {
     let compose = app.compose.as_ref()?;
     Some(Draft {
-        message: compose.textarea.lines().join("\n"),
+        message: expand_attachments(&compose.textarea.lines().join("\n"), &compose.attachments),
         target: compose.target.clone(),
         model: compose.model.clone(),
         carried_effort: app
@@ -1004,7 +1794,9 @@ fn draft(app: &App) -> Option<Draft> {
 /// fork jump or recorded the agent ([`App::set_last_new_agent`]) by the time it
 /// answers: a refused launch is not a start. A draft grows past the limit by typing
 /// or by several pastes, each within the paste cap, which is why the check is the
-/// draft's, not the paste's. Returns whether it refused.
+/// draft's, not the paste's, and it is asked of the EXPANDED message ([`draft`]) —
+/// the one that becomes the argument — never of the shorter placeholders the editor
+/// shows. Returns whether it refused.
 fn refuse_too_long(app: &mut App, message: &str) -> bool {
     match send::check_prompt_len(message) {
         Ok(()) => false,
@@ -1013,6 +1805,49 @@ fn refuse_too_long(app: &mut App, message: &str) -> bool {
             true
         }
     }
+}
+
+/// `text` with every occurrence of each of `attachments`' placeholders replaced by
+/// the attachment's `@"<absolute path>"` mention ([`file_mention`]). PURE.
+///
+/// Matches the EXACT placeholder each entry derives, never a parsed `[…#N]`
+/// shape, so text no entry of THIS box derives (typed, or pasted from another box,
+/// whose numbers this one never hands out) stays text, and a file name holding `[`
+/// or `]` cannot confuse it. One left-to-right pass over `text` that never
+/// re-scans what it wrote; where two entries could match at one position the
+/// earlier-recorded wins, though none can while `file_mention` refuses the `#`
+/// every placeholder holds. A mention claude's extractor would not read — glued to
+/// the character before it — is led by one space
+/// (`docs/agents/CLAUDE_CLI.md`, "File mentions reach claude, bare paths do not").
+/// An entry whose mention fails, impossible for a path accepted at attach time,
+/// leaves its placeholder as text.
+fn expand_attachments(text: &str, attachments: &[Attachment]) -> String {
+    let swaps: Vec<(String, String)> = attachments
+        .iter()
+        .filter_map(|a| file_mention(&a.path).ok().map(|m| (a.placeholder(), m)))
+        .collect();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        let hit = swaps.iter().find_map(|(placeholder, mention)| {
+            Some((rest.strip_prefix(placeholder.as_str())?, mention))
+        });
+        if let Some((after, mention)) = hit {
+            if out
+                .chars()
+                .next_back()
+                .is_some_and(|c| !is_mention_boundary(c))
+            {
+                out.push(' ');
+            }
+            out.push_str(mention);
+            rest = after;
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
 }
 
 /// Resolve the compose buffer into a driver [`Outcome`], routing on the open
@@ -1161,13 +1996,17 @@ fn submit_bg_launch(
 /// trailing positional, like a new session's prompt (probed for `-r
 /// --fork-session` at claude 2.1.291 on 2026-10-08; `docs/agents/CLAUDE_CLI.md`).
 ///
-/// A draft over [`send::COMPOSE_PROMPT_MAX_BYTES`] is refused first, on the fork and
+/// While the box's own explicit attach is reading, a draft or a fork hands off
+/// nothing: a transient nudge, the box, its text and the read untouched
+/// ([`submit_waits_for_attach`]). That wait comes first, as `Enter`'s does.
+///
+/// A draft over [`send::COMPOSE_PROMPT_MAX_BYTES`] is then refused, on the fork and
 /// the draft ([`refuse_too_long`]: sticky status, box kept, nothing recorded — the
 /// agent memory above is written only past it).
 ///
 /// INERT on a [`ComposeTarget::Reply`]: a reply addresses a session that already
 /// exists, so there is no new-session launch to escape to — and so nothing to
-/// refuse either, over the limit or not.
+/// refuse either, over the limit or not, and no run to hold for an attach.
 fn open_interactive(app: &mut App) -> Outcome {
     let Some(Draft {
         message,
@@ -1178,15 +2017,27 @@ fn open_interactive(app: &mut App) -> Outcome {
     else {
         return Outcome::Continue;
     };
-    // A reply launches nothing, so it has no prompt to refuse either.
-    if !matches!(target, ComposeTarget::Reply { .. }) && refuse_too_long(app, &message) {
+    let waits =
+        submit_waits_for_attach(app.compose.as_ref().and_then(|c| c.pending_attach.as_ref()));
+    // A reply launches nothing, so it has no prompt to refuse either. The wait comes
+    // before the size check, as `Enter`'s does: a draft still taking an attachment is
+    // told to wait, not told a size it is about to change.
+    if !matches!(target, ComposeTarget::Reply { .. }) && !waits && refuse_too_long(app, &message) {
         return Outcome::Continue;
     }
     // An empty / whitespace draft launches with NO positional, which is exactly what
     // the picker's own `Ctrl-O` (and an untouched fork box's) always emitted; a
     // fork is still named, from the session's label.
     let prompt = (!message.trim().is_empty()).then_some(message);
+    // Arm order is load-bearing: the reply's no-op comes before the wait, so a
+    // reply's `Ctrl-O` never shows the nudge.
     match target {
+        // No interactive launch on the reply target.
+        ComposeTarget::Reply { .. } => Outcome::Continue,
+        _ if waits => {
+            app.set_status_transient(CTRL_O_WHILE_ATTACHING_HINT);
+            Outcome::Continue
+        }
         ComposeTarget::NewBackgroundAgent { agent } => {
             // The board is about to be torn down for the interactive child, so the
             // card has nothing left to report: close the whole surface.
@@ -1209,8 +2060,6 @@ fn open_interactive(app: &mut App) -> Outcome {
                 carried_effort,
             )
         }
-        // No interactive launch on the reply target.
-        ComposeTarget::Reply { .. } => Outcome::Continue,
     }
 }
 
@@ -1399,7 +2248,7 @@ mod tests {
 
     use super::*;
     use crate::store::Session;
-    use crate::tui::app::Scope;
+    use crate::tui::app::{Scope, STATUS_DWELL_TICKS};
 
     /// Rows the tests below draw the editor into. The widget's screen map — and so
     /// [`ComposeState::screen_rows`] — is built from the drawn WIDTH alone, never the
@@ -3347,5 +4196,1067 @@ mod tests {
         assert!(app.sending.is_empty());
         assert!(app.fork_jump.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn ctrl_v() -> KeyEvent {
+        with_mods(KeyCode::Char('v'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_v_attaches_from_the_clipboard() {
+        for open in [false, true] {
+            for c in ['v', 'V'] {
+                assert_eq!(
+                    compose_key_to_action(with_mods(KeyCode::Char(c), KeyModifiers::CONTROL), open),
+                    ComposeAction::AttachClipboard
+                );
+            }
+        }
+        assert_eq!(
+            compose_key_to_action(key(KeyCode::Char('v')), false),
+            ComposeAction::Forward
+        );
+    }
+
+    #[test]
+    fn a_pending_attach_is_requested_once_and_a_second_ctrl_v_only_nudges() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        assert_eq!(take_clipboard_read(&mut app), None);
+        handle_compose_key(&mut app, ctrl_v());
+        let token = take_clipboard_read(&mut app)
+            .expect("asks the driver once")
+            .0;
+        assert_eq!(take_clipboard_read(&mut app), None);
+        handle_compose_key(&mut app, ctrl_v());
+        assert_eq!(app.status.as_deref(), Some(ATTACH_BUSY_HINT));
+        assert_eq!(take_clipboard_read(&mut app), None);
+        assert_eq!(
+            app.compose
+                .as_ref()
+                .unwrap()
+                .pending_attach
+                .as_ref()
+                .unwrap()
+                .token,
+            token
+        );
+    }
+
+    /// A submit (`Enter`, or `Ctrl-O`) waits only for an EXPLICIT read, requested
+    /// by the driver or not yet; never for the silent copied-file check, and never
+    /// with nothing pending.
+    #[test]
+    fn submit_waits_only_for_an_explicit_attach() {
+        let pending = |requested, purpose| PendingAttach {
+            token: 1,
+            requested,
+            purpose,
+        };
+        let upgrade = AttachPurpose::Upgrade {
+            inserted: "/tmp/a.png".to_string(),
+            lines_after: vec!["/tmp/a.png".to_string()],
+            cursor_after: (0, 10),
+        };
+        let rows = [
+            (None, false, "nothing pending"),
+            (
+                Some(pending(false, AttachPurpose::Explicit)),
+                true,
+                "an explicit read not yet handed to the driver",
+            ),
+            (
+                Some(pending(true, AttachPurpose::Explicit)),
+                true,
+                "an explicit read in flight",
+            ),
+            (
+                Some(pending(false, upgrade.clone())),
+                false,
+                "a silent check not yet handed over",
+            ),
+            (
+                Some(pending(true, upgrade)),
+                false,
+                "a silent check in flight",
+            ),
+        ];
+        for (pending, waits, case) in rows {
+            assert_eq!(submit_waits_for_attach(pending.as_ref()), waits, "{case}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_image_result_inserts_a_placeholder_and_a_stale_token_is_dropped() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "look");
+        handle_compose_key(&mut app, ctrl_v());
+        let token = take_clipboard_read(&mut app).unwrap().0;
+        finish_attach(
+            &mut app,
+            token + 1,
+            ClipboardAttach::Image(PathBuf::from("/tmp/a.png")),
+        );
+        assert_eq!(app.compose.as_ref().unwrap().textarea.lines(), ["look"]);
+        finish_attach(
+            &mut app,
+            token,
+            ClipboardAttach::Image(PathBuf::from("/tmp/a.png")),
+        );
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["look [Image #1] "]
+        );
+        assert!(app.compose.as_ref().unwrap().pending_attach.is_none());
+    }
+
+    #[test]
+    fn a_text_only_result_refuses_and_leaves_the_draft_alone() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "x");
+        handle_compose_key(&mut app, ctrl_v());
+        let token = take_clipboard_read(&mut app).unwrap().0;
+        finish_attach(&mut app, token, ClipboardAttach::TextOnly);
+        assert_eq!(app.compose.as_ref().unwrap().textarea.lines(), ["x"]);
+        assert_eq!(app.status.as_deref(), Some(ATTACH_TEXT_ONLY));
+    }
+
+    #[test]
+    fn a_file_shaped_paste_upgrades_only_when_the_clipboard_names_it_and_the_draft_is_unchanged() {
+        let files = vec![PathBuf::from("/tmp/my doc.pdf")];
+        let open = |app: &mut App| {
+            app.open_compose(ComposeState::new_background(None), None);
+            insert_paste(app, "/tmp/my doc.pdf");
+            take_clipboard_read(app)
+                .expect("a path-shaped paste asks the clipboard")
+                .0
+        };
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        let token = open(&mut app);
+        finish_attach(&mut app, token, ClipboardAttach::Files(files.clone()));
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["[my doc.pdf #1] "]
+        );
+
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        let token = open(&mut app);
+        type_into(&mut app, "!");
+        finish_attach(&mut app, token, ClipboardAttach::Files(files.clone()));
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["/tmp/my doc.pdf!"]
+        );
+
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        let token = open(&mut app);
+        finish_attach(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec![PathBuf::from("/tmp/other.pdf")]),
+        );
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["/tmp/my doc.pdf"]
+        );
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn paste_names_files_matches_each_rendering() {
+        let files = vec![PathBuf::from("/a/x y.png"), PathBuf::from("/b/z.txt")];
+        for yes in [
+            "/a/x y.png",
+            "/a/x y.png /b/z.txt",
+            "/a/x\\ y.png /b/z.txt",
+            "'/a/x y.png' '/b/z.txt'",
+            "\"/a/x y.png\" \"/b/z.txt\"",
+            "file:///a/x y.png file:///b/z.txt",
+            "file:///a/x%20y.png file:///b/z.txt",
+            "x y.png z.txt",
+            // Any rendering, with whitespace around it.
+            " /a/x y.png\n",
+        ] {
+            assert!(paste_names_files(yes, &files), "{yes}");
+        }
+        // A near miss of EVERY rendering above: its shape over the wrong files, or
+        // a broken variant of it. Collected, so a loosened rendering names every
+        // row it lets through.
+        let matched: Vec<&str> = [
+            "",
+            "hello",
+            // the first path raw: another file, or a path that is not the first
+            "/a/other.png",
+            "/b/z.txt",
+            // raw paths joined by a space: the wrong files, or the wrong order
+            "/a/x y.png /b/other.txt",
+            "/b/z.txt /a/x y.png",
+            // the very files joined by a newline, paths or names: no rendering,
+            // since `paste_may_name_files` never asks about a second line
+            "/a/x y.png\n/b/z.txt",
+            "x y.png\nz.txt",
+            // backslash-escaped paths joined by a space
+            "/a/x\\ y.png /b/other.txt",
+            // single-quoted, and quotes mixed
+            "'/a/x y.png' '/b/other.txt'",
+            "'/a/x y.png' \"/b/z.txt\"",
+            // double-quoted
+            "\"/a/x y.png\" \"/b/other.txt\"",
+            // `file://` URIs raw, and the scheme on one path only
+            "file:///a/x y.png file:///b/other.txt",
+            "file:///a/x y.png /b/z.txt",
+            // `file://` URIs percent-encoded
+            "file:///a/x%20y.png file:///b/other.txt",
+            // base names joined by a space
+            "x y.png other.txt",
+            // whitespace is trimmed around the paste only, never inside a path
+            "/a/x  y.png",
+        ]
+        .into_iter()
+        .filter(|no| paste_names_files(no, &files))
+        .collect();
+        assert!(
+            matched.is_empty(),
+            "near misses taken as the files: {matched:?}"
+        );
+    }
+
+    #[test]
+    fn paste_may_name_files_is_single_line_and_path_or_name_shaped() {
+        assert!(paste_may_name_files("/tmp/a b.png"));
+        assert!(paste_may_name_files("report.pdf"));
+        assert!(!paste_may_name_files("hello world"));
+        assert!(!paste_may_name_files("/a\n/b"));
+        assert!(!paste_may_name_files(""));
+    }
+
+    /// Pins `PASTE_FILE_NAMES_MAX_CHARS` (1024) by literal lengths, so a changed
+    /// cap moves one side of the boundary and fails here.
+    #[test]
+    fn paste_may_name_files_asks_about_a_1024_char_path_but_not_a_1025_char_one() {
+        let at_limit = format!("/{}", "a".repeat(1023));
+        let past_limit = format!("/{}", "a".repeat(1024));
+        assert_eq!(at_limit.chars().count(), 1024, "fixture");
+        assert_eq!(past_limit.chars().count(), 1025, "fixture");
+        assert!(paste_may_name_files(&at_limit));
+        assert!(!paste_may_name_files(&past_limit));
+    }
+
+    /// Pins `FILE_EXTENSION_MAX_CHARS` (8) by literal lengths: a `/`-free name
+    /// with an 8-char extension looks like a file, a 9-char one does not.
+    #[test]
+    fn paste_may_name_files_takes_an_8_char_extension_but_not_a_9_char_one() {
+        assert!(paste_may_name_files("notes.abcdefgh"));
+        assert!(!paste_may_name_files("notes.abcdefghi"));
+    }
+
+    /// Only a paste shaped like a rendering [`paste_names_files`] matches asks the
+    /// clipboard, and the stated exceptions (DOMAIN.md, Compose attach) still do,
+    /// so a later tightening is a visible change here. Collected, so a loosened or
+    /// tightened shape names every row it moves.
+    #[test]
+    fn paste_may_name_files_asks_only_about_a_files_rendering() {
+        let asks = [
+            // a raw absolute path, and absolute paths joined by a space
+            "/abs/x.png",
+            "/a/x y.png /b/z.txt",
+            // iTerm2's backslash-escaped paths start with the `/` itself
+            "/Users/me/My\\ File.png",
+            // an absolute path in single or double quotes
+            "'/abs/x.png'",
+            "\"/abs/x.png\"",
+            // `file://` URIs, raw or percent-encoded
+            "file:///abs/x.png",
+            "file:///abs/x%20y.png",
+            // `file` is the one scheme a paste may hold: alone, as several URIs,
+            // or beside a path
+            "file:///a/b.png",
+            "file:///a/b.png file:///c/d.png",
+            "/a/b.png file:///c/d.png",
+            // home-relative: asked, though no rendering can match it
+            "~/x.png",
+            // bare names, one or several, whitespace around them trimmed
+            "report.pdf",
+            "shot.JPEG notes.md",
+            "  report.pdf\n",
+            // the stated exceptions: text that still costs a read, as a leading-`/`
+            // word, a bare `/`, or dotted words that read as file names
+            "/compact",
+            "/",
+            "example.com",
+            "a@b.com",
+            "node.js",
+        ];
+        let never = [
+            // a scheme other than `file://`
+            "https://example.com/x.png",
+            "ftp://host/x.txt",
+            // ... anywhere in the paste, after a path that would ask
+            "/x https://y",
+            "/a/b.png https://example.com/c",
+            "'/a/b.png' ftp://h/f",
+            // ... even where no word opens with it
+            "/a/b.png (https://example.com)",
+            "/x/https://y",
+            // the scheme is the WHOLE run before `://`: `xfile` is not `file`
+            "/a/xfile:///b.png",
+            // a word opening with a `scheme:` other than `file:`
+            "mailto:a@b.com",
+            "http:",
+            "x.png mailto:a@b.com",
+            // a quoted `file://` URI: no rendering quotes one, so no prefix asks
+            "'file:///a/b.png'",
+            // a relative path
+            "a/b",
+            "src/main.rs",
+            // a version or a number: no letter in the extension
+            "v1.2",
+            "3.14",
+            "1.0.0",
+            // prose, ending in a file name or not
+            "hello world",
+            "the build is green.",
+            "see notes.txt",
+            // a bare name holding a space reads as words
+            "my doc.pdf",
+            // a dotfile has no stem
+            ".bashrc",
+            // more than one line, and nothing at all
+            "/a\n/b",
+            "",
+        ];
+        let misjudged: Vec<(&str, bool)> = asks
+            .iter()
+            .map(|t| (*t, true))
+            .chain(never.iter().map(|t| (*t, false)))
+            .filter(|(t, want)| paste_may_name_files(t) != *want)
+            .collect();
+        assert!(
+            misjudged.is_empty(),
+            "misjudged (paste, should ask): {misjudged:?}"
+        );
+    }
+
+    /// `Esc` cancels exactly the read `Enter` and `Ctrl-O` wait for — an EXPLICIT
+    /// one, handed to the driver or not yet — and never the silent copied-file
+    /// check or nothing at all, which leave `Esc` to cancel the box.
+    #[test]
+    fn esc_cancels_only_an_explicit_attach() {
+        let pending = |requested, purpose| PendingAttach {
+            token: 1,
+            requested,
+            purpose,
+        };
+        let upgrade = AttachPurpose::Upgrade {
+            inserted: "/tmp/a.png".to_string(),
+            lines_after: vec!["/tmp/a.png".to_string()],
+            cursor_after: (0, 10),
+        };
+        let rows = [
+            (None, false, "nothing pending"),
+            (
+                Some(pending(false, AttachPurpose::Explicit)),
+                true,
+                "an explicit read not yet handed to the driver",
+            ),
+            (
+                Some(pending(true, AttachPurpose::Explicit)),
+                true,
+                "an explicit read in flight",
+            ),
+            (
+                Some(pending(false, upgrade.clone())),
+                false,
+                "a silent check not yet handed over",
+            ),
+            (
+                Some(pending(true, upgrade)),
+                false,
+                "a silent check in flight",
+            ),
+        ];
+        for (pending, cancels, case) in rows {
+            assert_eq!(esc_cancels_attach(pending.as_ref()), cancels, "{case}");
+            assert_eq!(
+                submit_waits_for_attach(pending.as_ref()),
+                cancels,
+                "{case}: a read that holds the box is one `Esc` releases"
+            );
+        }
+    }
+
+    /// An explicit attach inserts a placeholder for every path a mention can carry,
+    /// the refused ones taking no number, and names EVERY refused path, whole, with
+    /// its own cause, on one sticky line.
+    #[test]
+    fn an_explicit_attach_inserts_the_accepted_placeholders_and_names_every_refused_path() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        handle_compose_key(&mut app, ctrl_v());
+        let token = take_clipboard_read(&mut app).unwrap().0;
+        finish_attach(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec![
+                PathBuf::from("/tmp/a.png"),
+                PathBuf::from("/tmp/bad#name.png"),
+                PathBuf::from("/tmp/c.png"),
+                PathBuf::from("/tmp/q\"uote.png"),
+            ]),
+        );
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["[a.png #1] [c.png #2] "]
+        );
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                "not attached: \"/tmp/bad#name.png\" \u{2014} its path contains a #; \
+                 \"/tmp/q\\\"uote.png\" \u{2014} its path contains a double quote"
+            )
+        );
+        assert!(app.status_ttl.is_none(), "a refusal is sticky");
+    }
+
+    /// An explicit attach that can mention none of its files leaves the draft
+    /// byte-identical, caret included, and names every one; a newline in a path is
+    /// escaped, so the refusal stays ONE line.
+    #[test]
+    fn an_explicit_attach_with_every_path_refused_leaves_the_draft_and_names_all() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "keep");
+        let before = draft_snapshot(&app);
+        handle_compose_key(&mut app, ctrl_v());
+        let token = take_clipboard_read(&mut app).unwrap().0;
+        finish_attach(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec![
+                PathBuf::from("/tmp/a#.png"),
+                PathBuf::from("/tmp/b\nc.png"),
+            ]),
+        );
+        assert_eq!(draft_snapshot(&app), before);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                "not attached: \"/tmp/a#.png\" \u{2014} its path contains a #; \
+                 \"/tmp/b\\nc.png\" \u{2014} its path contains a control character"
+            )
+        );
+        assert!(app.status_ttl.is_none(), "a refusal is sticky");
+    }
+
+    /// An image the read could not save, because no mention can carry its cache
+    /// path, leaves the draft byte-identical and names that path and its cause on
+    /// the same sticky `not attached: …` line a refused file gets.
+    #[test]
+    fn an_unmentionable_image_names_its_path_and_leaves_the_draft() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "keep");
+        let before = draft_snapshot(&app);
+        handle_compose_key(&mut app, ctrl_v());
+        let token = take_clipboard_read(&mut app).unwrap().0;
+        finish_attach(
+            &mut app,
+            token,
+            ClipboardAttach::Unmentionable(PathBuf::from("/cfg#1/cache/paste/paste-1-2.png")),
+        );
+        assert_eq!(draft_snapshot(&app), before);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                "not attached: \"/cfg#1/cache/paste/paste-1-2.png\" \u{2014} its path contains a #"
+            )
+        );
+        assert!(app.status_ttl.is_none(), "a refusal is sticky");
+    }
+
+    /// The open draft's lines and caret.
+    fn draft_snapshot(app: &App) -> (Vec<String>, (usize, usize)) {
+        let textarea = &app.compose.as_ref().unwrap().textarea;
+        (textarea.lines().to_vec(), cursor_pos(textarea))
+    }
+
+    /// Paste `text` into a fresh draft holding `tail` AFTER the caret, finish its
+    /// upgrade check with `files`, and return the app and the draft right after the
+    /// paste.
+    fn upgrade_with(text: &str, files: &[&str]) -> (App, (Vec<String>, (usize, usize))) {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        type_into(&mut app, "tail");
+        app.compose
+            .as_mut()
+            .unwrap()
+            .textarea
+            .move_cursor(CursorMove::Head);
+        insert_paste(&mut app, text);
+        let pasted = draft_snapshot(&app);
+        let token = take_clipboard_read(&mut app)
+            .expect("a path-shaped paste asks the clipboard")
+            .0;
+        let files = files.iter().map(PathBuf::from).collect();
+        finish_attach(&mut app, token, ClipboardAttach::Files(files));
+        (app, pasted)
+    }
+
+    /// A paste the clipboard confirms, one of whose files no mention can carry, is
+    /// not upgraded at all: the verbatim paste and its caret stay, and a sticky
+    /// refusal names the refused file.
+    #[test]
+    fn an_upgrade_with_one_refused_path_keeps_the_paste_and_caret_and_names_it() {
+        let (app, pasted) =
+            upgrade_with("/tmp/a.png /tmp/b#c.png", &["/tmp/a.png", "/tmp/b#c.png"]);
+        assert_eq!(
+            pasted,
+            (vec!["/tmp/a.png /tmp/b#c.pngtail".to_owned()], (0, 23)),
+            "the paste went in before the caret, ahead of the typed tail"
+        );
+        assert_eq!(draft_snapshot(&app), pasted);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("paste kept as text, cannot attach: \"/tmp/b#c.png\" \u{2014} its path contains a #")
+        );
+        assert!(app.status_ttl.is_none(), "a refusal is sticky");
+    }
+
+    /// Every refused file of a kept paste is named, whole, so two of one name in
+    /// different folders stay apart.
+    #[test]
+    fn an_upgrade_with_two_refused_paths_names_both() {
+        let (app, pasted) = upgrade_with(
+            "/a/shot#1.png /b/shot#1.png",
+            &["/a/shot#1.png", "/b/shot#1.png"],
+        );
+        assert_eq!(draft_snapshot(&app), pasted);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                "paste kept as text, cannot attach: \"/a/shot#1.png\" \u{2014} its path contains a #; \
+                 \"/b/shot#1.png\" \u{2014} its path contains a #"
+            )
+        );
+    }
+
+    /// Every result that attaches nothing leaves the draft byte-identical and says
+    /// its own words.
+    #[test]
+    fn each_no_attach_result_sets_its_exact_refusal_and_leaves_the_draft_alone() {
+        let rows = [
+            (ClipboardAttach::TextOnly, ATTACH_TEXT_ONLY),
+            (ClipboardAttach::Nothing, ATTACH_NOTHING),
+            (ClipboardAttach::UnsupportedImage, ATTACH_UNSUPPORTED_IMAGE),
+            (ClipboardAttach::TooLarge, ATTACH_TOO_LARGE),
+            (ClipboardAttach::RemoteSession, ATTACH_REMOTE),
+            (ClipboardAttach::NoDisplay, ATTACH_NO_DISPLAY),
+            (ClipboardAttach::NoTool, ATTACH_NO_TOOL),
+            (ClipboardAttach::Failed, ATTACH_FAILED),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (result, want) in rows {
+            assert!(seen.insert(want), "{want}: each refusal has its own words");
+            let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+            app.open_compose(ComposeState::new_background(None), None);
+            type_into(&mut app, "keep");
+            handle_compose_key(&mut app, ctrl_v());
+            let token = take_clipboard_read(&mut app).unwrap().0;
+            finish_attach(&mut app, token, result.clone());
+            assert_eq!(app.status.as_deref(), Some(want), "{result:?}");
+            assert_eq!(app.compose.as_ref().unwrap().textarea.lines(), ["keep"]);
+        }
+        assert_eq!(
+            ATTACH_REMOTE,
+            "cannot read the clipboard over SSH \u{2014} it would be the remote machine's"
+        );
+        assert_eq!(
+            ATTACH_NOTHING,
+            "nothing to attach \u{2014} the clipboard is empty"
+        );
+    }
+
+    /// The silent file-paste check never saves an image and never blocks `Ctrl-V`.
+    #[test]
+    fn an_upgrade_read_lists_only_and_an_explicit_ctrl_v_takes_over() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        insert_paste(&mut app, "/tmp/a.png");
+        let (upgrade_token, mode) = take_clipboard_read(&mut app).unwrap();
+        assert_eq!(mode, ReadMode::ListOnly);
+        assert!(!app
+            .compose
+            .as_ref()
+            .unwrap()
+            .pending_attach
+            .as_ref()
+            .unwrap()
+            .shows_mark());
+        handle_compose_key(&mut app, ctrl_v());
+        assert_eq!(app.status, None, "no busy nudge for a silent check");
+        let (token, mode) = take_clipboard_read(&mut app).expect("the explicit read starts");
+        assert_eq!(mode, ReadMode::Attach);
+        assert_ne!(token, upgrade_token);
+        finish_attach(
+            &mut app,
+            upgrade_token,
+            ClipboardAttach::Files(vec![PathBuf::from("/tmp/a.png")]),
+        );
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["/tmp/a.png"],
+            "the superseded check's result is dropped"
+        );
+    }
+
+    /// A confirmed copied-file paste of two files becomes a placeholder for EACH,
+    /// numbered in the clipboard's order, in place of the pasted span.
+    #[test]
+    fn an_upgrade_inserts_a_placeholder_for_every_clipboard_file() {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        insert_paste(&mut app, "/tmp/a.png /tmp/b.pdf");
+        let token = take_clipboard_read(&mut app)
+            .expect("a path-shaped paste asks the clipboard")
+            .0;
+        finish_attach(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec![
+                PathBuf::from("/tmp/a.png"),
+                PathBuf::from("/tmp/b.pdf"),
+            ]),
+        );
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["[a.png #1] [b.pdf #2] "]
+        );
+    }
+
+    /// Finish an explicit `Ctrl-V` read with `result` on a fresh draft.
+    fn explicit_attach_with(result: ClipboardAttach) -> App {
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        handle_compose_key(&mut app, ctrl_v());
+        let token = take_clipboard_read(&mut app).unwrap().0;
+        finish_attach(&mut app, token, result);
+        app
+    }
+
+    fn files(paths: &[&str]) -> ClipboardAttach {
+        ClipboardAttach::Files(paths.iter().map(PathBuf::from).collect())
+    }
+
+    /// The confirmation is transient: it expires on its own.
+    fn assert_transient_status(app: &App, want: &str) {
+        assert_eq!(app.status.as_deref(), Some(want));
+        assert_eq!(
+            app.status_ttl,
+            Some(STATUS_DWELL_TICKS),
+            "a confirmation expires"
+        );
+    }
+
+    #[test]
+    fn attached_status_names_the_first_path_and_counts_the_rest() {
+        let p = |s: &'static str| Path::new(s);
+        assert_eq!(attached_status(&[]), None);
+        assert_eq!(
+            attached_status(&[p("/a/x.pdf")]).as_deref(),
+            Some("attached \"/a/x.pdf\"")
+        );
+        assert_eq!(
+            attached_status(&[p("/a/x.pdf"), p("/b/y.png"), p("/c/z.txt")]).as_deref(),
+            Some("attached \"/a/x.pdf\" (+2 more)")
+        );
+    }
+
+    /// The path is shown by the refusal lines' own quoting, so each row's path
+    /// reads as `Debug` escapes it. Each row: what the path holds, the path, and
+    /// the line the status holds. Collected, so a broken row names itself.
+    #[test]
+    fn attached_status_escapes_what_would_mislead_a_reader() {
+        let rows: [(&str, &str, &str); 7] = [
+            (
+                "a bidi override",
+                "/tmp/doc\u{202e}fdp.exe",
+                "attached \"/tmp/doc\\u{202e}fdp.exe\"",
+            ),
+            (
+                "a zero-width space",
+                "/tmp/a\u{200b}b.pdf",
+                "attached \"/tmp/a\\u{200b}b.pdf\"",
+            ),
+            (
+                "an ideographic space",
+                "/tmp/a\u{3000}b.pdf",
+                "attached \"/tmp/a\\u{3000}b.pdf\"",
+            ),
+            (
+                "combining marks (a decomposed e-acute)",
+                "/tmp/Re\u{301}sume\u{301}.pdf",
+                "attached \"/tmp/Re\\u{301}sume\\u{301}.pdf\"",
+            ),
+            (
+                "a private-use code point",
+                "/tmp/a\u{e000}b.pdf",
+                "attached \"/tmp/a\\u{e000}b.pdf\"",
+            ),
+            (
+                "a backslash",
+                "/tmp/a\\b.pdf",
+                "attached \"/tmp/a\\\\b.pdf\"",
+            ),
+            (
+                "a plain space (kept, quoted)",
+                "/tmp/my doc.pdf",
+                "attached \"/tmp/my doc.pdf\"",
+            ),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter_map(|(what, path, want)| {
+                let got = attached_status(&[Path::new(path)]);
+                (got.as_deref() != Some(*want)).then(|| format!("{what}: {got:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn an_explicit_attach_of_one_file_confirms_its_full_path() {
+        let app = explicit_attach_with(files(&["/tmp/docs/report.pdf"]));
+        assert_transient_status(&app, "attached \"/tmp/docs/report.pdf\"");
+    }
+
+    #[test]
+    fn an_explicit_attach_of_several_files_names_the_first_and_counts_the_rest() {
+        let app = explicit_attach_with(files(&["/tmp/a.pdf", "/tmp/b.pdf", "/tmp/c.pdf"]));
+        assert_transient_status(&app, "attached \"/tmp/a.pdf\" (+2 more)");
+    }
+
+    #[test]
+    fn a_screenshot_attach_gets_no_confirmation() {
+        let app = explicit_attach_with(ClipboardAttach::Image(PathBuf::from(
+            "/cfg/cache/paste/paste-1-2.png",
+        )));
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["[Image #1] "]
+        );
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn an_upgrade_of_one_file_confirms_its_full_path() {
+        let (app, _) = upgrade_with("/tmp/docs/a.png", &["/tmp/docs/a.png"]);
+        assert_transient_status(&app, "attached \"/tmp/docs/a.png\"");
+    }
+
+    #[test]
+    fn an_upgrade_of_several_files_names_the_first_and_counts_the_rest() {
+        let (app, _) = upgrade_with(
+            "/tmp/a.png /tmp/b.pdf /tmp/c.txt",
+            &["/tmp/a.png", "/tmp/b.pdf", "/tmp/c.txt"],
+        );
+        assert_transient_status(&app, "attached \"/tmp/a.png\" (+2 more)");
+    }
+
+    /// A refusal is never replaced: this attach's own (the accepted files still go
+    /// in, only the sticky refusal shows), nor one already on the line when the
+    /// read lands.
+    #[test]
+    fn a_confirmation_never_replaces_a_refusal() {
+        let app = explicit_attach_with(files(&["/tmp/a.png", "/tmp/bad#name.png"]));
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["[a.png #1] "]
+        );
+        assert!(app
+            .status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("not attached: ")));
+        assert!(app.status_ttl.is_none(), "the refusal stays sticky");
+
+        let mut app = App::new(Vec::new(), Scope::All, PathBuf::from("/tmp"));
+        app.open_compose(ComposeState::new_background(None), None);
+        handle_compose_key(&mut app, ctrl_v());
+        let token = take_clipboard_read(&mut app).unwrap().0;
+        app.set_status("an earlier failure");
+        finish_attach(&mut app, token, files(&["/tmp/a.png"]));
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.lines(),
+            ["[a.png #1] "]
+        );
+        assert_eq!(app.status.as_deref(), Some("an earlier failure"));
+        assert!(app.status_ttl.is_none());
+    }
+
+    /// The first, narrowest case of the overlap rule: a token the caret ends that
+    /// sits typed wholly INSIDE a placeholder some entry derives, which then stands
+    /// whole around it with the token taken out. The rule is wider than these rows
+    /// (a token that starts inside, ends inside or holds a placeholder; its own table is
+    /// `a_token_overlapping_a_recorded_placeholder_is_told_from_one_clear_of_it`).
+    /// The rows are the caret cases: between the two spaces of a file name that
+    /// holds two in a row, with the token's query typed on, past the placeholder's
+    /// trailing space, before the placeholder, a lookalike no entry derives, and
+    /// another entry's number.
+    #[test]
+    fn a_token_typed_inside_a_recorded_placeholder_is_told_from_one_beside_it() {
+        let held = vec![Attachment {
+            kind: AttachmentKind::File,
+            path: PathBuf::from("/tmp/a  b.pdf"),
+            number: 1,
+        }];
+        let one = |text: &str, col: usize, attachments: &[Attachment]| {
+            token_overlaps_placeholder(&[text.to_owned()], (0, col), attachments)
+        };
+        // `[a ` is 3 columns, so column 4 is right after an `@` typed between the
+        // two spaces: `[a @ b.pdf #1]`.
+        assert!(one("[a @ b.pdf #1]", 4, &held), "between the two spaces");
+        assert!(one("[a @x b.pdf #1]", 5, &held), "its query typed on");
+        assert!(
+            !one("[a  b.pdf #1] @", 15, &held),
+            "past the trailing space"
+        );
+        assert!(
+            !one("@ [a  b.pdf #1]", 1, &held),
+            "a token before the placeholder"
+        );
+        assert!(!one("[a @ b.pdf #1]", 4, &[]), "no entry derives it");
+        let other = vec![Attachment {
+            number: 2,
+            ..held[0].clone()
+        }];
+        assert!(!one("[a @ b.pdf #1]", 4, &other), "another entry's number");
+    }
+
+    /// The guard through the caret, as a keystroke reaches it: a token the caret
+    /// ends overlaps a recorded placeholder when it holds typed characters AND the
+    /// placeholder's own, or is begun by them, or starts before the placeholder and
+    /// ends inside it, not only when it was typed wholly inside. A token that stands
+    /// clear of the placeholder, or one beside a placeholder that characters outside
+    /// the token have already broken, overlaps nothing. Collected, so a broken rule
+    /// names every row it breaks.
+    #[test]
+    fn a_token_overlapping_a_recorded_placeholder_is_told_from_one_clear_of_it() {
+        let held: Vec<Attachment> = [("/tmp/a  b.pdf", 1), ("/tmp/my report.pdf", 2)]
+            .into_iter()
+            .map(|(path, number)| Attachment {
+                kind: AttachmentKind::File,
+                path: PathBuf::from(path),
+                number,
+            })
+            .collect();
+        // (the line, the caret column, whether the token overlaps a placeholder)
+        let rows: [(&str, usize, bool); 11] = [
+            ("[a @ b.pdf #1]", 4, true),
+            ("[my @report.pdf #2]", 15, true),
+            ("[my @report.pdfX #2]", 16, true),
+            ("[my @re@port.pdf #2]", 16, true),
+            ("@x[my report.pdf #2]", 5, true),
+            ("/x[my report.pdf #2]", 5, true),
+            ("@x [my report.pdf #2]", 2, false),
+            ("[my report.pdf #2] @x", 21, false),
+            ("[my x @report.pdf #2]", 17, false),
+            ("[my @report.pdf #9]", 15, false),
+            ("[a b @ c.pdf #1]", 6, false),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter_map(|&(text, col, want)| {
+                let lines = [text.to_owned()];
+                // A caret with no token never reaches the overlap rule, so a row
+                // there would prove nothing about it.
+                if completion_context(&lines, (0, col)).is_none() {
+                    return Some(format!("{text:?} at {col}: no token reaches the rule"));
+                }
+                let got = token_overlaps_placeholder(&lines, (0, col), &held);
+                (got != want).then(|| format!("{text:?} at {col}: got {got}, want {want}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Where a placeholder's span is, against a token range given outright, so the
+    /// relations a keystroke cannot reach are asked too: a token inside it (set
+    /// aside wholly, partly, or not at all), straddling its start, straddling its
+    /// end and holding all of it overlap; one ending where it starts or starting
+    /// where it ends does not, nor does an empty token or one beside a placeholder
+    /// that characters outside the token have broken. Collected, so a broken rule
+    /// names every row it breaks.
+    #[test]
+    fn a_placeholder_span_is_told_from_a_token_range_by_how_they_overlap() {
+        let chars = |text: &str| -> Vec<char> { text.chars().collect() };
+        let small = chars("[a.pdf #1]");
+        let long = chars("[my report.pdf #1]");
+        // (the row, the line, the token's range, the placeholder, overlaps)
+        type Row<'a> = (&'a str, &'a str, Range<usize>, &'a [char], bool);
+        let rows: [Row; 14] = [
+            (
+                "inside, typed between its characters",
+                "[a.@pdf #1]",
+                3..4,
+                &small,
+                true,
+            ),
+            (
+                "inside, its own characters alone",
+                "[a.pdf #1]",
+                1..6,
+                &small,
+                true,
+            ),
+            (
+                "inside, typed and its own characters",
+                "[my @report.pdf #1]",
+                4..15,
+                &long,
+                true,
+            ),
+            (
+                "inside, typed in two places",
+                "[my @re@port.pdf #1]",
+                4..16,
+                &long,
+                true,
+            ),
+            ("straddling the start", "@x[a.pdf #1]", 0..5, &small, true),
+            ("straddling the end", "[a.pdf #1]@xy", 7..13, &small, true),
+            ("enclosing", "@[a.pdf #1]x", 0..12, &small, true),
+            ("adjacent on the left", "@x[a.pdf #1]", 0..2, &small, false),
+            (
+                "adjacent on the right",
+                "[a.pdf #1]@x",
+                10..12,
+                &small,
+                false,
+            ),
+            ("clear on the left", "@x [a.pdf #1]", 0..2, &small, false),
+            ("clear on the right", "[a.pdf #1] @x", 11..13, &small, false),
+            ("an empty token", "[a.pdf #1]", 3..3, &small, false),
+            (
+                "broken outside the token",
+                "[my x @report.pdf #1]",
+                6..17,
+                &long,
+                false,
+            ),
+            ("an empty placeholder", "@x", 0..2, &[], false),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter_map(|(row, text, token, placeholder, want)| {
+                let got = overlaps_placeholder(&chars(text), token.clone(), placeholder);
+                (got != *want).then(|| format!("{row}: got {got}, want {want}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Each row: the draft text, the box's attachments, and the message sent. Only
+    /// the exact placeholder an entry derives is swapped, every occurrence of it,
+    /// and a mention glued to what precedes it is led by one space. Collected, so a
+    /// broken rule names every row it breaks.
+    #[test]
+    fn expand_attachments_swaps_only_each_recorded_placeholder() {
+        let entry = |kind, path: &str, number| Attachment {
+            kind,
+            path: PathBuf::from(path),
+            number,
+        };
+        let shot = entry(AttachmentKind::Image, "/tmp/red square.png", 1);
+        let other = entry(AttachmentKind::Image, "/tmp/b.png", 2);
+        let bracketed = entry(AttachmentKind::File, "/tmp/[draft] v2.pdf", 3);
+        let rows: Vec<(&str, &str, Vec<Attachment>, &str)> = vec![
+            (
+                "at the start",
+                "[Image #1] hi",
+                vec![shot.clone()],
+                "@\"/tmp/red square.png\" hi",
+            ),
+            (
+                "after a space",
+                "see [Image #1] ",
+                vec![shot.clone()],
+                "see @\"/tmp/red square.png\" ",
+            ),
+            (
+                "after a newline",
+                "line\n[Image #1]",
+                vec![shot.clone()],
+                "line\n@\"/tmp/red square.png\"",
+            ),
+            (
+                "glued to a word",
+                "look[Image #1] ",
+                vec![shot.clone()],
+                "look @\"/tmp/red square.png\" ",
+            ),
+            (
+                "after a NEL, which is no boundary to claude",
+                "a\u{85}[Image #1]",
+                vec![shot.clone()],
+                "a\u{85} @\"/tmp/red square.png\"",
+            ),
+            (
+                "after a BOM and an ideographic space, which are",
+                "\u{feff}[Image #1]\u{3000}[Image #2]",
+                vec![shot.clone(), other.clone()],
+                "\u{feff}@\"/tmp/red square.png\"\u{3000}@\"/tmp/b.png\"",
+            ),
+            (
+                "two glued placeholders",
+                "[Image #1][Image #2]",
+                vec![shot.clone(), other.clone()],
+                "@\"/tmp/red square.png\" @\"/tmp/b.png\"",
+            ),
+            (
+                "a file name holding [ and ]",
+                "[[draft] v2.pdf #3] ",
+                vec![bracketed.clone()],
+                "@\"/tmp/[draft] v2.pdf\" ",
+            ),
+            (
+                "a typed placeholder no entry derives",
+                "[Image #9] ",
+                vec![shot.clone()],
+                "[Image #9] ",
+            ),
+            (
+                "another name under an entry's number",
+                "[report.pdf #2] [Image #2]",
+                vec![other.clone()],
+                "[report.pdf #2] @\"/tmp/b.png\"",
+            ),
+            (
+                "the same placeholder twice",
+                "[Image #1] and [Image #1]",
+                vec![shot.clone()],
+                "@\"/tmp/red square.png\" and @\"/tmp/red square.png\"",
+            ),
+            (
+                "an entry whose placeholder was deleted",
+                "just text",
+                vec![shot.clone()],
+                "just text",
+            ),
+            (
+                "no placeholder at all",
+                "naïve\t[Image#1] [draft] v2.pdf @\"/x\"\n",
+                vec![shot, bracketed],
+                "naïve\t[Image#1] [draft] v2.pdf @\"/x\"\n",
+            ),
+        ];
+        let wrong: Vec<String> = rows
+            .into_iter()
+            .filter_map(|(case, text, attachments, want)| {
+                let got = expand_attachments(text, &attachments);
+                (got != want).then(|| format!("{case}: {got:?} != {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

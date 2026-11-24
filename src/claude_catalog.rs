@@ -119,9 +119,10 @@ const CATALOG_READER_GRACE: Duration = Duration::from_millis(500);
 
 /// `process_group`'s argument for "a NEW group whose id is the child's own pid"
 /// (`setpgid(0, 0)` in the child), which is what lets [`kill_group`] name the
-/// group by the pid `Child::id` reports.
+/// group by the pid `Child::id` reports. Shared with the clipboard read's
+/// children (`tui::clipboard`), which are killed the same way.
 #[cfg(unix)]
-const NEW_PROCESS_GROUP: i32 = 0;
+pub(crate) const NEW_PROCESS_GROUP: i32 = 0;
 
 /// How often the reaper asks whether the child has exited. claude exits 25–50 ms
 /// after its stdin reaches EOF (measured, claude 2.1.284, 2026-09-30), so a
@@ -631,8 +632,12 @@ fn reap(child: &mut Child, deadline: Instant) {
 /// strictly positive (`killpg(2)` reads `0` as the caller's own group) and never
 /// the board's own pid. A pid that rule refuses, which a spawned child's never
 /// is, falls back to killing the child alone.
+///
+/// The clipboard read (`tui::clipboard::run_capture`) is the other caller: its
+/// children are spawned with [`NEW_PROCESS_GROUP`] too, and killed past their
+/// timeout under the same contract.
 #[cfg(unix)]
-fn kill_group(child: &mut Child) {
+pub(crate) fn kill_group(child: &mut Child) {
     let Some(pgid) = crate::send::signallable_pid(child.id(), std::process::id()) else {
         let _ = child.kill();
         return;
@@ -653,7 +658,7 @@ fn kill_group(child: &mut Child) {
 /// The off-unix stand-in for the unix [`kill_group`]: there is no process
 /// group to name, so it kills the child alone, as `Child::kill` does.
 #[cfg(not(unix))]
-fn kill_group(child: &mut Child) {
+pub(crate) fn kill_group(child: &mut Child) {
     let _ = child.kill();
 }
 

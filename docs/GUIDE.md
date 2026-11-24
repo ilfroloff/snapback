@@ -30,12 +30,13 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `←` / `→` | Move the **cursor in your search** one character, to fix a typo without retyping the rest. The list and the preview stay where they are. While the preview shows a subagent's transcript they step through the session's subagents instead (the `←` / `→` row below), again only while it is on screen |
 | `Alt+←` / `Alt+→` (`⌥←` / `⌥→`) / `Alt+B` / `Alt+F` / `Ctrl-←` / `Ctrl-→` | Move the **cursor in your search** one **word**, landing where a word jump in the reply box does: forward goes to the start of the next word. Depending on the terminal, `⌥←` / `⌥→` arrives as `Alt+←` / `Alt+→` or as `Alt+B` / `Alt+F`, so both are bound; `Ctrl-←` / `Ctrl-→` does the same without Option. The list and the preview stay where they are |
 | `Enter` | **Resume** the selected session, returning to the board when it exits (with the find bar open it steps to the older match instead and never resumes). On a **running** session it opens an **Attach / Fork / Cancel** choice instead. A session snapback is still sending a quick reply to, or still making as a fork from the `Ctrl-X f` box's `Enter` (its preview reads `claude cooking…`), is refused until that lands — the session the fork came from resumes as usual. A session snapback is still moving (`Ctrl-X w`, the row reads `moving…`) is refused until the move finishes |
-| `Ctrl-X` then `f` | **Fork** the selected session into a copy — available for any session, running or not, except one snapback is still moving (`Ctrl-X w`), which is refused until the move finishes. Opens a fork box (after a folder check: a deleted folder is refused before you type). `Enter` forks it **without leaving the board**, like a quick reply, and when the fork appears the cursor opens its fold and jumps to it if you haven't moved and nothing else is open (another box, a picker or a prompt); `Ctrl-O` forks it **interactively** (an empty box is the plain fork, plus `--effort` when the session's last turn recorded a known level — see *Carry a session's effort*; a typed message auto-submits as the fork's first turn); `Ctrl-L` picks the model for that fork; `Ctrl-J` / `Alt+Enter` newline; `Esc` cancels; a `/` or `@` opens the pick list (the `/` or `@` row below). Either way the fork is **named** `fork: <first line of your message>` (`fork: <the session's label>` for an empty box) and folds under the session it came from, which stays the row on top (see *Fork without leaving the board* and *Forks you make stay under the session you forked*). The headless fork can't answer permission prompts, like a quick reply |
+| `Ctrl-X` then `f` | **Fork** the selected session into a copy — available for any session, running or not, except one snapback is still moving (`Ctrl-X w`), which is refused until the move finishes. Opens a fork box (after a folder check: a deleted folder is refused before you type). `Enter` forks it **without leaving the board**, like a quick reply, and when the fork appears the cursor opens its fold and jumps to it if you haven't moved and nothing else is open (another box, a picker or a prompt); `Ctrl-O` forks it **interactively** (an empty box is the plain fork, plus `--effort` when the session's last turn recorded a known level — see *Carry a session's effort*; a typed message auto-submits as the fork's first turn); `Ctrl-L` picks the model for that fork; `Ctrl-V` attaches a file or screenshot (the `Ctrl-V` row below; `Enter` and `Ctrl-O` wait while it reads, and `Esc` cancels the read before the box); `Ctrl-J` / `Alt+Enter` newline; `Esc` cancels; a `/` or `@` opens the pick list (the `/` or `@` row below). Either way the fork is **named** `fork: <first line of your message>` (`fork: <the session's label>` for an empty box) and folds under the session it came from, which stays the row on top (see *Fork without leaving the board* and *Forks you make stay under the session you forked*). The headless fork can't answer permission prompts, like a quick reply |
 | `Ctrl-F` | **Find text in the preview.** Opens a small `find:` bar on the preview's top border, and what you type is marked in the transcript the pane shows — the session's own, or a subagent's — the way your search query marks it. The list is never re-filtered, the selection never moves and your search query stays as typed. Typing, `Backspace`, the cursor keys and a paste edit the bar; every other key keeps its meaning. The preview jumps to the newest match as you type, `Shift-↑` / `Shift-↓` step between matches, `Enter` steps to the older one (it never resumes while the bar is open), and `Esc` closes it (see *Find text in the transcript you are reading*) |
-| `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Ctrl-L` picks its model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list (the `/` or `@` row below). Your message is sent as the session's first turn either way |
+| `Ctrl-N` | **Start a new session** in the launch directory; if you have Claude Code agents defined, pick one first (or `default (no agent)`). Then a **draft box** opens for the session's first message: `Enter` launches it with `claude --bg` and leaves you on the board, `Ctrl-O` runs it interactively instead, `Ctrl-L` picks its model, `Ctrl-V` attaches a file or screenshot (the `Ctrl-V` row below; `Enter` and `Ctrl-O` wait while it reads, and `Esc` cancels the read before the box), `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list (the `/` or `@` row below). Your message is sent as the session's first turn either way |
 | `Ctrl-O` (in that picker) | **Start the highlighted agent interactively at once**, skipping the draft — the same thing `Ctrl-O` means inside the draft box, so either route out of the picker is one keypress |
-| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place, and so is a waiting one (`needs input`) whose record says nothing of a process (Claude Code reports no process id, status or waiting reason for it); any other waiting one (`needs input`) asks you to confirm that stop, naming what it waits on when Claude Code says; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent (for a fork made with the `Ctrl-X f` box's `Enter`, while the fork itself is still being made), or snapback is moving the session (`Ctrl-X w`), `Ctrl-R` on that session is refused until that finishes; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels, and a `/` or `@` opens the pick list — the `/` or `@` row below) |
+| `Ctrl-R` | **Quick reply** — send a one-shot message to the selected session without leaving the board. A background agent whose run is over (`done`, `stopped`, `failed`) is stopped first so the reply lands in place, and so is a waiting one (`needs input`) whose record says nothing of a process (Claude Code reports no process id, status or waiting reason for it); any other waiting one (`needs input`) asks you to confirm that stop, naming what it waits on when Claude Code says; one that is still live (`working`, `idle`, `interrupted`, or a state this version doesn't recognize) is left alone and refused, and so is a session with no background job to stop first (a `live` one, for instance); the refusal suggests `Ctrl-K` or Fork instead. While a session's own reply is still being sent (for a fork made with the `Ctrl-X f` box's `Enter`, while the fork itself is still being made), or snapback is moving the session (`Ctrl-X w`), `Ctrl-R` on that session is refused until that finishes; replies to other sessions can go out at the same time. Opens a compose box (`Enter` sends, `Ctrl-L` picks the model, `Ctrl-V` attaches a file or screenshot and `Enter` waits while it reads, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels (a read still pending first, then the box), and a `/` or `@` opens the pick list — the `Ctrl-V` and `/` or `@` rows below) |
 | `Ctrl-L` (in a reply, fork or draft box) | **Pick the model** — and, with `←` / `→`, its **effort** — for **this message only**. The box's bottom border names what it will run on: a reply or fork says `model: session (Opus 5.5)`, the model that session last answered with, which Claude Code normally keeps on its own — or `model: session (Opus 5.5 · xhigh)` when that turn also recorded an effort, which the message then carries as `--effort`; a draft says `model: default (opus[1m]) (new sessions only)` when your Claude Code settings name a model. Either says plain `model: default` when there is nothing to name. `--model` is sent only when you pick something, and so is any effort you pick; the one exception is that session's own effort in the `session (… · xhigh)` label, which a reply or fork carries on its own. The picker's first row goes back to the default. Every new box starts at the default, and nothing is remembered. `Enter` resume, the Attach / Fork choice, Attach and the `Ctrl-X w` move never send a model or an effort |
+| `Ctrl-V` (in a reply, fork or draft box) | **Attach a file or screenshot** from your OS clipboard — the same in a `Ctrl-R` reply, a `Ctrl-X f` fork and a `Ctrl-N` draft. Copied files of any type go in first, each used where it is (never copied) and shown in the box as `[<file name> #N]` (the status line briefly shows the full path of the first, and a count of the rest); otherwise a copied image (PNG, JPEG, GIF or WebP) is saved under `~/.config/snapback/cache/paste/` (`$SNAPBACK_CONFIG_DIR`) and shown as `[Image #N]`; files saved there are pruned after 7 days. `N` counts up for as long as snapback runs. The box never shows a path, only the placeholder; the message sent carries each one still in your text as its full path, `@"<path>"`, which Claude Code attaches, and one you edited by hand is sent as plain text. The box's border reads `attaching…` meanwhile. When nothing is attached your text stays exactly as it was and the status line says why, until your next key: the clipboard holds only text (paste that with your terminal's own paste, `Cmd+V` / `Ctrl-Shift-V`), it is empty, the image format isn't supported, the image is over 25 MiB, you're on SSH, there's no display, the clipboard tool isn't installed, or the read failed (it timed out or the tool errored). A copied file whose path can't be mentioned is named with the reason while the other files still go in, and an image whose saved path can't be mentioned is named the same way and not saved. One attach at a time: `Ctrl-V` again only reminds you, and so do `Enter`, which sends, forks or launches nothing until the attachment lands, and a fork's or draft's `Ctrl-O`, which runs nothing until then (a `Cmd+V` of copied files never holds either). `Esc` while it reads cancels the attach and keeps your text exactly as it was; a second `Esc` closes the box (with the pick list open, the first `Esc` closes the list). Needs `osascript` (built in) on macOS, `wl-paste` (wl-clipboard) or `xclip` on Linux. `Cmd+V` also attaches most copied files where your terminal pastes their path on one line, and a screenshot where it sends an empty paste (VS Code, Cursor); iTerm2 and the JetBrains terminals send nothing for a screenshot, so use `Ctrl-V` there. A terminal that binds `Ctrl-V` as its own paste never passes it on: use `Cmd+V` / `Ctrl-Shift-V` or the empty-paste route there. Details under *Attach a screenshot or a file* |
 | `/` or `@` (in a reply, fork or draft box) | **Pick a skill, command, file or agent** — the same list in a `Ctrl-R` reply, a `Ctrl-X f` fork and a `Ctrl-N` draft. `/` as the very first character lists the skills and commands Claude Code offers in that folder, built-in ones included; `@` at the start of a word lists files and folders (`@src/tu` narrows inside `src/`; once you type a letter the list also reaches files in deeper folders, so `@disc` finds `src/store/discover.rs`) and, for a top-level `@`, the folder's agents, inserted as `@agent-<name>`. A skill, command or agent shows its description on the right, and a `/` row says in a dim column whether it is a `built-in`, `skill` or `command`. The letters you type narrow the list to what holds them anywhere in its name or, for a skill, command or agent, its description, matched like the search box (an uppercase letter matches exactly) and highlighted the same way. `-`, `_` and `.` split what you type into parts that match in any order, so `@site-stor` finds `src/modules/sitemaps/sitemaps-storage.service.ts`; each part is matched as typed, never fuzzily. A name is also found by the starts of its words, in order (a capital you type matches exactly and starts a word), so `@calis` or `@CaLis` finds `CategoryListings.tsx`, `/gws` finds `git-worktree-setup` and `@csr` finds the agent `cr-swe-rust`. Such a hit lists just below the names that hold your letters as typed within its own tier, so one at a name's start lists above a name that holds them later in it, and always above description matches — from two letters on, never in a description, and not in the whole-path search below. A `/` lists the folder it names first; when that lists nothing (no such folder, or nothing in it matches), `/` splits parts too and the whole path is searched from the top, so `@modules/site-stor` finds the same file and picking it writes its full path. Names that start with them come first, then other name matches, then description matches, with an agent ahead of a file or folder in the same tier (a bare `@` lists the agents first); a file or folder whose name starts with `.` shows only once you type its leading `.`. While it is open `↑` / `↓` choose, `Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc` closes only the list — never the draft; with no list open `Enter` and `Esc` do what the box's own row says. Where the list comes from is under *Quick reply without leaving the board* |
 | `Ctrl-K` | **Stop / interrupt** the selected session's live agent. On a background agent it runs `claude stop`: one whose run is over (`done`, `stopped`, `failed`) stops immediately; every other live agent (`working`, `needs input`, `idle`, `interrupted`, unrecognized) confirms first, since stopping ends the live job (its conversation is kept). A session with no background job (a `live` one, typically) has no job to stop, so if Claude Code reports a process id for it, `Ctrl-K` offers to send that process a **SIGTERM** instead: the confirmation shows the pid, and nothing is sent unless Claude Code still reports that same pid when you press `Enter`. A session that isn't running as an agent has nothing to stop, and neither does one Claude Code reports with no job and no process id that can be signalled |
 | `Ctrl-X` then `x` / `d` / `h` / `r` / `y` / `f` / `z` / `w` / `↓` / `?` | **Leader chord** that acts on the selected row (`x`, `d`, `y`, `f`, `z`, `w`, `↓`) or on the whole board (`h`, `r`) — `x` **hides** the selected session (reversible, persisted) — from a row that shows a stack (a `(+N)` row, or an open stack's top row with `↳` copies under it), that row and the copies it shows; from any other row, just that session — `d` **hard-deletes** it after a confirmation that, on a stack's top row, can also take the whole stack, `h` toggles **show hidden**, `r` **re-reads every transcript from disk**, `y` is **copy session ID**: the selected session's full id goes to your clipboard and shows on the status line, `f` **forks** the selected session (the `Ctrl-X` then `f` row above), `z` **folds** / **expands** a stack of look-alike rows that are really one conversation — a row marked `(+N)` stands for `N` more; `z` opens it, and folds it back from any of its rows, `w` **moves** the session to another worktree of this project (the main folder included, the session's own folder left out) without leaving the board — from a stack's top row, that session or the whole stack, `↓` **shows a subagent's transcript** in the preview — the first one still running, else the one written most recently — and, pressed again, goes back (see *Hide, delete, copy, fold & move*), `?` opens the **key map** (the same modal as `F1`). Any other key cancels the chord |
@@ -58,7 +59,7 @@ filters the list live. `Tab` widens the match from name-only to name+content.
 | `Backspace` | Delete the query character before the cursor |
 | `Alt+Backspace` (`⌥⌫`) / `Ctrl-W` / `Alt+H` | Delete the query **word** before the cursor — one whole search term, so a path or a branch name goes in a single press instead of character by character (`Backspace` alone still takes one character); whatever follows the cursor stays. All three keys do the same thing, because which of them your terminal actually sends depends on how it treats **Option**; they are also the same three the reply, fork and draft boxes word-delete on, so the gesture is bound wherever you type. What a press *cuts* differs on purpose: on the board it takes a whole search term, so `feature/fold-fork-lineages` goes in one press, while in a reply, fork or draft box the cut stops at punctuation and takes only `lineages` |
 | any printable char | Type to search, at the cursor |
-| paste (`Cmd`/`Ctrl-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line), up to the size one `claude` argument can be (about 128 KB on Linux, 768 KB on macOS; a longer paste is cut and says so, and a longer message — typed, or built up from several pastes — is refused, with the box and your text kept, on `Enter` in any box and on `Ctrl-O` in a fork or draft box); on the board, into the query — or the find bar, while it is open — at its cursor with newlines as spaces, up to 4,096 characters. It never sends, resumes, or confirms |
+| paste (`Cmd+V` / `Ctrl-Shift-V`, middle-click) | Your terminal's own paste, taken as **text**: into a compose or draft box at the cursor, **newlines intact** (no more sending just the first line), up to the size one `claude` argument can be (about 128 KB on Linux, 768 KB on macOS; a longer paste is cut and says so, and a longer message — typed, or built up from several pastes — is refused, with the box and your text kept, on `Enter` in any box and on `Ctrl-O` in a fork or draft box); on the board, into the query — or the find bar, while it is open — at its cursor with newlines as spaces, up to 4,096 characters. It never sends, resumes, or confirms. In a reply, fork or draft box, `Cmd+V` of copied files (where your terminal pastes their path or name on one line) becomes their `[<file name> #N]` placeholders, sent as `@"<path>"` (with the same `attached "<full path>"` status line as `Ctrl-V`); if one of them can't be attached, the paste stays as text and the status line says which and why. A bare name with a space or without a lettered extension (`my doc.pdf`, `Makefile`), and a paste naming a scheme other than `file:` (`https://…`, `mailto:…`), stay text: attach those files with `Ctrl-V`. A few text pastes still make snapback check the clipboard, and stay text: a slash command such as `/compact`, a bare `/`, or a dotted word such as `example.com`, `a@b.com` or `node.js`. An empty paste there acts as `Ctrl-V` (the `Ctrl-V` row above) |
 | `Esc` | Close the find bar when it is open; else clear the search query; with nothing typed, leave a subagent's transcript for the session's own (even one the `1:0` layout or a card hides); with neither, quit |
 | `F1`, `Ctrl-X ?`, `Ctrl+Shift+/` (`Ctrl-?`) | Open the **full key map** as a table in a modal; `↑`/`↓` (or `k`/`j`)/`PgUp`/`PgDn`/`Home`/`End` and the mouse wheel scroll it; `Esc`, `Ctrl-C`, `F1` or `Ctrl+Shift+/` closes it (`Ctrl-X ?` only opens it — inside the modal the leader chord is inert). It owns the keyboard like every modal. `Ctrl-X ?` (two plain keys) works in every terminal and `F1` in most (GNOME Terminal keeps it for its own Help, and a Mac laptop keyboard needs `Fn`+`F1`). The help line at the foot of the board ends with `F1 keys` for it: it lists the `Ctrl` keys in priority order and drops the last ones when the terminal is too narrow for all of them (on the default board, 80 columns shows `^F find` through `^X actions`; in a subagent's transcript, which always keeps `↑↓ live ←→ all` and `Esc back` ahead of its keys, it shows `^F find` through `^K stop`, and `^X actions` only on a wider terminal), and `^X actions` is the `Ctrl-X` leader chord, whose follow-ups appear the moment it is pressed. `Ctrl+Shift+/` often cannot be delivered at all (many terminals send `Ctrl-?` as Backspace), and without the kitty keyboard protocol it is indistinguishable from `Ctrl-/`, so that and `Ctrl-?` open it where they arrive |
 | `Ctrl-C` | Quit from the board; while a modal, a confirmation, the key map or a pending `Ctrl-X` chord is open it closes or cancels that instead, and in a compose box it never quits (`Esc` cancels the box) |
@@ -482,7 +483,9 @@ files and folders show at once; its skills, commands and agents appear once
 Claude Code's list for that folder arrives. A reply can offer the agents its
 transcript recorded in the meantime, but a session that does not exist yet has no
 transcript. If Claude Code doesn't trust that folder, the list leaves out the
-repository's own skills, commands and agents (why is below).
+repository's own skills, commands and agents (why is below). `Ctrl-V` attaches a
+copied file or screenshot to the draft as it does in a reply (see *Attach a
+screenshot or a file* below).
 
 **Or take the terminal instead.** `Ctrl-O` runs the agent interactively, handing
 you the terminal as usual. It works from the draft box (if you change your mind
@@ -509,7 +512,8 @@ context, appends the exchange in place, and the reply shows up in the preview, a
 while the board stays up. The box is a real multiline editor — arrows move the
 caret, long lines soft-wrap, and it grows from one line as you type (`Ctrl-J` or
 `Alt+Enter` for a newline, `Enter` to send, `Ctrl-L` to pick the model this one
-message runs on — see *Pick the model for one message* below). Type `/` at the
+message runs on, and `Ctrl-V` to attach a copied file or screenshot — see *Pick
+the model for one message* and *Attach a screenshot or a file* below). Type `/` at the
 very start to list the skills and commands Claude Code offers in the session's
 folder — built-in ones such as `/compact` included, but not the ones Claude Code
 hides from its own `/` menu — or `@` (at the start of a word) to list files and
@@ -553,7 +557,8 @@ once you type its leading `.`.
 While a list is open `↑`/`↓` choose,
 `Enter` or `Tab` picks (a folder reopens the list one level down), and `Esc`
 closes only the list — it never discards the draft; with no list open `Enter`
-sends and `Esc` cancels as usual. The moment you
+sends and `Esc` cancels as usual (an attachment still being read first, then
+the box). The moment you
 send, your message appears in the preview under a **you** turn, followed by a live **claude
 cooking…** placeholder — so the exchange reads normally while the reply is still
 in flight. The placeholder is replaced in place as `claude` writes the
@@ -610,7 +615,7 @@ that may still be working over a guess. Use `Ctrl-K` if you do want it stopped �
 session — any session, running or not, since a fork never disturbs the original;
 only a session snapback is still moving (`Ctrl-X w`) is refused until the move
 finishes. It is the reply box again (the same editor, the same `/` and `@` list, `Ctrl-L`
-for the model, the preview's scroll keys), titled `fork: <the session's label>`.
+for the model, `Ctrl-V` to attach, the preview's scroll keys), titled `fork: <the session's label>`.
 `Enter` forks with a one-shot `claude -p`, like a quick reply: the session you
 forked is left exactly as it was, and the fork is a new session. When it appears
 on the list the cursor follows it, opening the stack it lands in, unless you have
@@ -786,13 +791,15 @@ the modal `F1` opens.
   them are hidden the prompt leads with the numbers (`3 in this lineage, 2 of
   them hidden`), so the count on the button is never more than you expected.
 
-Hiding is the only thing snapback ever writes for itself. It keeps a small file
+Hiding is the only thing snapback remembers for itself. It keeps a small file
 of per-session settings in its own config directory —
 `$SNAPBACK_CONFIG_DIR/state/sessions.json` if you set `SNAPBACK_CONFIG_DIR`,
 otherwise `~/.config/snapback/state/sessions.json` — never inside the Claude Code
 session store, which snapback otherwise only reads. It is plain JSON, one entry
 per session (`{"<session id>": {"hidden": true}}`), with a `sessions.json.lock`
-beside it; leave the lock file where it is.
+beside it; leave the lock file where it is. (The screenshots you attach are saved
+under the same config directory as a short-lived cache: see *Attach a screenshot
+or a file*.)
 
 Two snapback windows can hide sessions at the same time: each hide adds only its
 own change to the file, so neither window undoes the other's, and each window
@@ -921,6 +928,94 @@ not know) sends no flag. Picking a model in the box replaces it, and so does an
 environment override of the model, which also says plain `model: default`. A
 `CLAUDE_CODE_EFFORT_LEVEL` in your environment still beats it, and the label does
 not show that.
+
+**Attach a screenshot or a file.** `Ctrl-V` in any compose box — a quick reply
+(`Ctrl-R`), a fork (`Ctrl-X f`) or a new-session draft (`Ctrl-N`) — attaches what
+your OS clipboard holds. A terminal's paste can only carry text, so snapback reads
+the clipboard itself, in the background; the box's border reads `attaching…`
+until it's done, and pressing `Ctrl-V` again meanwhile only reminds you that it's
+already reading. `Enter` waits for it too: it reminds you, sends nothing and
+leaves your text alone, so `Enter` never sends your message without the
+attachment you asked for; press `Enter` again once it lands. A fork's or draft's
+`Ctrl-O` waits the same way, so the interactive run never starts without it either;
+press `Ctrl-O` again once it lands. Changed your mind, or the read is stuck?
+`Esc` cancels the attach and leaves your text exactly as it was; a second `Esc`
+closes the box. (The quiet check behind a `Cmd+V` of copied files, below, never
+holds `Enter` or `Ctrl-O`, and is not an attach `Esc` cancels.)
+
+- **Files first, then an image.** Copy one or more files (in Finder or your file
+  manager) and press `Ctrl-V`: each shows up in the box as `[<file name> #N]`
+  (`[report.pdf #2]`), used where it is and never copied. With no file on the
+  clipboard, a copied image — a screenshot, say — is saved and shows up as
+  `[Image #N]`. `N` counts up for as long as snapback runs, across every box, so
+  no two attachments share one. The box shows only that placeholder, so when
+  copied files go in the status line briefly says `attached "<full path>"`
+  (`attached "<first full path>" (+N more)` for several): the path in quotes,
+  escaped the way Rust's `Debug` escapes a string (`docs/agents/DOMAIN.md`
+  cites its source). The line can hide characters that draw with zero width,
+  and it is cut at the end of a narrow terminal.
+  A path holding a double quote, a `#` or a control character such as a tab or
+  newline is refused instead, never attached, and that refusal stays on the
+  line. A screenshot saved to the cache gets no such line. PNG, JPEG, GIF and
+  WebP are taken (on macOS a PNG, JPEG or TIFF image is saved as PNG, while a
+  GIF or WebP keeps its format); any other image format is refused. A file copy
+  that also carries the file's icon attaches the file, not the icon.
+- **`Cmd+V`.** Your terminal handles `Cmd+V` itself, so snapback only sees what it
+  pastes. Copied files attach where the terminal pastes their path or name on
+  one line (VS Code and iTerm2 do): snapback checks that the clipboard really
+  holds those files and swaps the pasted text for their placeholders (with the
+  same `attached "<full path>"` line as `Ctrl-V`), unless you typed in between;
+  otherwise the paste stays plain text. It checks only a paste
+  that looks like such a path or name, so some copied files always stay text:
+  files pasted one per line, a bare name with a space or without a lettered
+  extension (`my doc.pdf`, `Makefile`, `v1.2`), and a path or name holding a
+  scheme other than `file:` (`https://…`, `mailto:…`); use `Ctrl-V` for those.
+  And a few text pastes look enough like one to be checked, and are left as
+  you pasted them: a slash command such as `/compact`, a bare `/`, or a dotted
+  word such as `example.com`, `a@b.com` or `node.js`. A screenshot attaches
+  through `Cmd+V` only where the terminal sends an empty paste for it (VS Code,
+  Cursor); iTerm2 and the JetBrains terminals send nothing, so use `Ctrl-V`
+  there. A terminal that binds `Ctrl-V` as its own paste never passes the key
+  on; use `Cmd+V` / `Ctrl-Shift-V` or the empty-paste route there.
+- **What is sent.** The box shows `[Image #N]` or `[<file name> #N]` and never
+  the path. When you send, each placeholder still in your text is
+  replaced by a mention of the file's full path, `@"<full path>"`, so the message
+  Claude Code receives, and the session's transcript and label afterwards, carry
+  the path. That is ordinary text in your message, and Claude Code attaches the
+  file itself: text,
+  images, PDFs and folders are read; other binaries (a `.docx`, say) are only
+  named. An image is embedded when the message is sent, so resuming the session
+  later never needs the file. A bare path would not work: a one-shot `claude -p`
+  has nobody to approve reading a file outside the session's folder. A
+  placeholder you edit by hand is sent as the plain text it now is, and nothing
+  is attached for it.
+- **Paths that can't be attached.** Claude Code's mention format can't carry
+  every path, so snapback refuses one containing `"`, `#` or a control character
+  such as a newline, one with an `@` right after whitespace (or after `。`, `、`,
+  `？` or `！`), and one ending in ` (agent)`. The status line names each such file
+  and why. With `Ctrl-V` the other files still go in; with `Cmd+V` of copied
+  files the whole paste stays as text if any one of them can't be attached, so
+  nothing you pasted disappears. The same goes for a screenshot whose place in
+  the cache can't be mentioned (your config folder's path holds a `#`, say): it
+  is named the same way and never saved.
+- **When nothing is attached**, your text is left exactly as it was and the status
+  line says why: the clipboard holds only text (paste that with `Cmd+V` /
+  `Ctrl-Shift-V`), it's empty, the image format isn't supported, the image is
+  over 25 MiB, you're on SSH, there's no display, the clipboard tool isn't
+  installed, or the clipboard couldn't be read (it timed out or the tool
+  failed). These messages stay until your next key.
+- **The cache.** Saved images go to `~/.config/snapback/cache/paste/`
+  (`$SNAPBACK_CONFIG_DIR/cache/paste/` if you set `SNAPBACK_CONFIG_DIR`), a folder
+  only you can open. Files there older than 7 days are deleted every time the
+  board starts — when you launch snapback and each time you come back from a
+  session — and before each new image is saved. An image saved for an attach you
+  cancelled with `Esc` is deleted at once. Files you attach by copying them are
+  never touched.
+- **Linux** needs `wl-paste` (the `wl-clipboard` package) under Wayland or
+  `xclip` under X11; `xsel` can copy but can't read images. macOS uses its
+  built-in `osascript`. Over SSH `Ctrl-V` is refused, because the clipboard
+  snapback could read would be the remote machine's, not yours; with no display
+  it is refused too.
 
 **Readable transcript preview.** Beside the list sits a preview of the selected
 session rendered as clean, scrollable markdown — the real conversation, whole,

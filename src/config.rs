@@ -1,13 +1,12 @@
 //! Snapback-owned path resolution — the SINGLE place that reads the environment
 //! to locate snapback's own directories.
 //!
-//! Every snapback-owned path (config today; state below; any future cache) is
-//! resolved HERE and nowhere else: no other module reads the environment for
-//! these locations. When a new snapback-owned path is needed (a cache dir, a
+//! Every snapback-owned path (config, persistent state, and the prunable paste
+//! cache below) is resolved HERE and nowhere else: no other module reads the
+//! environment for these locations. When a new snapback-owned path is needed (a
 //! settings file, …), add its resolver to THIS module rather than reading an env
 //! var elsewhere, so the "one env reader" invariant holds and the tests keep a
-//! single injection seam. (No such resolver exists yet — YAGNI; this module is
-//! simply their documented home.)
+//! single injection seam.
 //!
 //! The root is `$SNAPBACK_CONFIG_DIR` if set and non-empty (the test/override
 //! seam, mirroring `$CLAUDE_PROJECTS_DIR` for the read-only Claude store), else
@@ -39,6 +38,12 @@ const CONFIG_DIR_NAME: &str = "snapback";
 /// settings/config file at the root never sits beside churny state files.
 const STATE_SUBDIR: &str = "state";
 
+/// Subdirectory of the config dir holding prunable CACHE (not persistent state).
+const CACHE_SUBDIR: &str = "cache";
+
+/// Subdirectory of the cache dir holding clipboard attachments.
+const PASTE_SUBDIR: &str = "paste";
+
 /// Resolve snapback's config directory — the ROOT of every snapback-owned path.
 ///
 /// `$SNAPBACK_CONFIG_DIR` if set and non-empty, else `~/.config/snapback`.
@@ -69,6 +74,17 @@ pub fn config_dir() -> PathBuf {
 /// `state/` need not pre-exist: the save `create_dir_all`s it on demand.
 pub fn state_dir() -> PathBuf {
     config_dir().join(STATE_SUBDIR)
+}
+
+/// Resolve the clipboard-attachment cache: `<config>/cache/paste`
+/// (`~/.config/snapback/cache/paste` by default). This is prunable CACHE, not
+/// `state/`: claude embeds an attached file's content at send time, so a pasted
+/// image only has to outlive the open draft, and losing one costs nothing that
+/// cannot be re-pasted. It need not pre-exist: the writer creates it on demand.
+/// `tui::clipboard` prunes its expired files before each image write and at every
+/// board start.
+pub fn paste_cache_dir() -> PathBuf {
+    config_dir().join(CACHE_SUBDIR).join(PASTE_SUBDIR)
 }
 
 /// The ONE crate-wide lock serializing EVERY test that mutates a process-global
@@ -188,6 +204,22 @@ mod tests {
             state_dir(),
             dir.join("state"),
             "with the override set, persistent state lands under `<config>/state`"
+        );
+        std::env::remove_var("SNAPBACK_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- paste_cache_dir --------------------------------------------------
+
+    #[test]
+    fn paste_cache_dir_is_cache_paste_under_the_config_dir() {
+        let _guard = env_lock();
+        let dir = unique_temp_dir("paste-cache");
+        std::env::set_var("SNAPBACK_CONFIG_DIR", &dir);
+        assert_eq!(
+            paste_cache_dir(),
+            dir.join("cache").join("paste"),
+            "attachments land under `<config>/cache/paste`, never `state/`"
         );
         std::env::remove_var("SNAPBACK_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,7 +1,8 @@
 //! Snapback-owned persistent state: the per-session state map, whose only field
 //! today is `hidden`.
 //!
-//! This is the ONLY persistent state snapback writes, and it lives in a SEPARATE,
+//! This is the ONLY persistent state snapback writes (the compose attach's paste
+//! cache is prunable cache beside it), and it lives in a SEPARATE,
 //! snapback-owned directory ([`crate::config::state_dir`]) — NEVER inside the
 //! read-only Claude store under `~/.claude/projects/`. A hidden session is a
 //! VISIBILITY preference (hide the row from the board), not a status claim about

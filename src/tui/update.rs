@@ -20,7 +20,9 @@
 //! subagent transcript writes, draws the subagent view again when it shows one of
 //! them and marks the selected session's subagent record to be read again — never
 //! a reload — and `SubagentRuns` lands the background refresh's record while it
-//! still names the selected session.
+//! still names the selected session. `ClipboardRead` lands the compose attach's
+//! clipboard read (`Ctrl-V`) into the box that asked for it, and drops a result
+//! whose token no open compose holds.
 //! Because such a result can arrive after the board it belongs to is gone,
 //! [`handle_event`] closes the compose surface, and forgets every compose
 //! pick-list catalog fetch still in flight (`CatalogFetched`), on any [`Outcome`]
@@ -48,16 +50,17 @@
 //! | `Alt-Left` / `Alt-Right`, `Alt-b` / `Alt-f`, `Ctrl-Left` / `Ctrl-Right` | move the search query's caret one WORD back / forward (always) — the widget's own word hop (see [`App::move_query_caret_by_word`]), so forward lands on the START of the next word, as in the reply box. Not a query change either. Three pairs because `⌥←` / `⌥→` reaches the board as `CSI 1;3D` / `C` or as `ESC b` / `ESC f` depending on the terminal, and `Ctrl-Left` / `Ctrl-Right` is the non-`Alt` twin; `Alt-b` / `Alt-f` and `Ctrl-Left` / `Ctrl-Right` are also the pairs the compose box hops words on |
 //! | `Enter` | resume the selected session — unless the find bar is open, where it steps to the previous (older) match, as `Shift-Up` does, and never resumes (a no-op with nothing marked). Refused, before the liveness probe, while snapback's own `claude -p` child is still writing that session — a quick reply to it, or on a fork's row the headless fork creating it (see [`send::resume_in_flight_refusal`]) — and while its own `Ctrl-X w` move of that session is still in flight (see [`App::moving_on`]). A reply or fork in flight on another row refuses nothing here, and neither does a headless fork on the row it was forked from, which its child only reads |
 //! | `Ctrl-F` | open the FIND BAR on the preview's top border: a `find:` input whose text marks the transcript the pane shows — the selected session's own, or the subagent view's — by the board search's own rule ([`App::open_find`]). Printable keys, edits and a paste go to it while it is open; every other key keeps its board meaning, so it is not a keyboard owner and `Left` / `Right` still step subagents in the view. It never re-filters the list, moves the selection or touches the board query, and a typed word jumps the preview to the newest match. `Shift-Up` / `Shift-Down` and `Enter` step the marks (below); `Esc` closes it. From the 1:0 layout it brings the preview back at 1:1; a step to 1:0 and a `Ctrl-N` draft card close it, and it does not open while a draft card is on the pane, while a reply or fork box leaves it open |
-//! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels; `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
+//! | `Ctrl-N` | start a new session in the launch directory. When agents are defined a picker opens first and `Enter` on a pick opens a draft pane for the session's first message; with none defined that draft opens straight away. In the draft, `Enter` starts a BACKGROUND agent without leaving the board, `Ctrl-O` runs it interactively instead, `Esc` cancels; `Ctrl-V` attaches a copied file or image (the `Ctrl-V` row below; `Enter` and `Ctrl-O` wait while it reads, and `Esc` cancels the read before the box); `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-O` (in the agent picker) | start the highlighted agent INTERACTIVELY at once, skipping the draft — the same verb `Ctrl-O` names inside the draft, so BOTH routes out of the picker cost exactly one key. Bound on the picker alone — inert on every other modal |
-//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place, and so is a REGISTRY-ONLY `needs input` agent (`blocked` with no `pid`, `status` or `waitingFor` key); any other `needs input` confirms first, naming what it waits on when claude said; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight (on a fork's row, the headless fork making it — its `claude -p` child is recorded under the fork's id), `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]), and so it is while its `Ctrl-X w` move is; a reply or a move still in flight on another row refuses nothing here. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
+//! | `Ctrl-R` | quick-reply: send a one-shot message to the selected session without leaving the board. An agent whose run is OVER (`done` / `stopped` / `failed`) is stopped first so the reply lands in place, and so is a REGISTRY-ONLY `needs input` agent (`blocked` with no `pid`, `status` or `waitingFor` key); any other `needs input` confirms first, naming what it waits on when claude said; `working` / `idle` / `interrupted` / an unrecognized qualifier is refused, and so is a session claude reports with no stoppable job id — the refusal points at `Ctrl-K` or Fork (see [`send::reply_gate`]). While this session's OWN reply is still in flight (on a fork's row, the headless fork making it — its `claude -p` child is recorded under the fork's id), `Ctrl-R` on it is refused before any of the above (see [`send::reply_in_flight_refusal`]), and so it is while its `Ctrl-X w` move is; a reply or a move still in flight on another row refuses nothing here. In the box `Ctrl-V` attaches a copied file or image (the `Ctrl-V` row below; `Enter` waits while it reads, and `Esc` cancels the read before the box), and `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open |
 //! | `Ctrl-K` | stop / interrupt the selected session's live agent, by whichever handle claude's record carries (see [`send::interrupt_gate`]). A stoppable job id → `claude stop`: an agent whose run is OVER (`done` / `stopped` / `failed`) stops at once, every other live agent confirms first. NO job id but a `pid` → confirm, then re-ask claude at `Enter` and send that pid a SIGTERM (never SIGKILL) only if claude still reports the same pid with no job id; a record that is gone, now carries a job id, or reports another pid refuses instead (see [`send::signal_plan`]). A session claude is not holding, or one it reports with neither a job id nor a pid — or with no job id and a pid no signal could take (`0`, past `i32::MAX`, or the board's own process id) — is refused |
 //! | `Tab` | toggle name-only vs. name+content search. Widening to content also opens the preview on the most recent match, exactly as typing does: it goes through the same query funnel, and the mode is the gate that key just opened |
 //! | `Ctrl-A` | flip the scope: current folder <-> project (the launch repo and all of its git worktrees). ONE key for both, because the second is a refinement of the same question the first answers, not a separate mode. Launched with `--all`/`-a` it becomes a three-stop cycle through all folders as well — the whole store is on this key only when the launch flag put it there |
-//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`z`/`w`/`↓`/`?` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fork the selected session: opens a fork compose box after the move and folder checks (refused, like `Enter`, while snapback's own `Ctrl-X w` move of that session is still in flight; a deleted folder is refused before you type; no live-agent check, claude skips it for a fork). `Enter` forks it headless without leaving the board (`claude -p -r <id> --fork-session --session-id <new> --name <name>`, like a quick reply — once the fork appears, folded under the session it came from, the cursor expands that lineage and jumps to it, if you have not moved and nothing owns the keyboard — see [`App::keyboard_owned`]), `Ctrl-O` forks it interactively (an empty box with no pick is the plain `claude -r <id> --fork-session` plus its `--name`, plus `--effort <level>` when the session's last turn recorded a known one — see the `Ctrl-L` row), `Ctrl-L` picks the model for that fork, `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Both name the fork `fork: <first line of the message>` (`fork: <the session's label>` for an empty `Ctrl-O`; see `resume::fork_name`), which keeps the session heading its forks (`lineage::head_of`). The Attach/Fork/Cancel choice's Fork hands off exactly the argv of an empty `Ctrl-O` with no pick only while the session has no carried effort (otherwise that `Ctrl-O` adds `--effort <level>`), and never carries a model or an effort. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open / fold (`z`) or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight / `↓` opens a subagent's own transcript in the preview — the SUBAGENT VIEW (the `◆ delegated to …` click row below) — on the first RUNNING subagent in launch order (unfinished and not failed, and it or a subagent it launched wrote in the last 10 minutes), else the most recently written one, and, pressed again in the view, leaves it as `Esc` does; a typed query stays. It reads no file: the selected session's subagents are read in the background whenever the selection moves or one of them writes, and `↓` refuses on a sticky status line while that read has not landed, or when the session has none (see [`App::open_subagent_target`]) / `?` opens the key-map modal (the terminal-independent twin of `F1`) (any other key cancels) |
+//! | `Ctrl-X` then `x`/`d`/`h`/`r`/`y`/`f`/`z`/`w`/`↓`/`?` | leader chord: hide (from a row that visibly stands for others — a folded `(+N)` head, or an expanded head with `↳` rows beneath it — that row and the members it stands for on screen, so the fold cannot re-head, while members off the board (filtered out by the query, out of scope, already hidden) stay as they are; any other row that session alone: a `↳` row, or a head whose other members are all off the board; un-hiding from such a head exposes every member it stands for, one hidden on its own included — see [`App::toggle_hidden_selected`]) / hard-delete (this row; on a multi-member lineage's HEAD row — the row not drawn `↳` — the confirm also offers its whole fork lineage, never on a `↳` row, and still on a head standing alone, since the confirm counts the lineage and discloses its hidden members; a member whose quick reply, headless fork or move snapback still has in flight is refused, see [`delete::can_delete_target`]) / toggle show-hidden / re-read every transcript from disk / copy session ID (the selected session's full id, to the clipboard; the id also shows on the status line) / fork the selected session: opens a fork compose box after the move and folder checks (refused, like `Enter`, while snapback's own `Ctrl-X w` move of that session is still in flight; a deleted folder is refused before you type; no live-agent check, claude skips it for a fork). `Enter` forks it headless without leaving the board (`claude -p -r <id> --fork-session --session-id <new> --name <name>`, like a quick reply — once the fork appears, folded under the session it came from, the cursor expands that lineage and jumps to it, if you have not moved and nothing owns the keyboard — see [`App::keyboard_owned`]), `Ctrl-O` forks it interactively (an empty box with no pick is the plain `claude -r <id> --fork-session` plus its `--name`, plus `--effort <level>` when the session's last turn recorded a known one — see the `Ctrl-L` row), `Ctrl-L` picks the model for that fork, `Ctrl-V` attaches a copied file or image (the `Ctrl-V` row below; `Enter` and `Ctrl-O` wait while it reads, and `Esc` cancels the read before the box), `Ctrl-J` / `Alt+Enter` newline, `Esc` cancels. Both name the fork `fork: <first line of the message>` (`fork: <the session's label>` for an empty `Ctrl-O`; see `resume::fork_name`), which keeps the session heading its forks (`lineage::head_of`). The Attach/Fork/Cancel choice's Fork hands off exactly the argv of an empty `Ctrl-O` with no pick only while the session has no carried effort (otherwise that `Ctrl-O` adds `--effort <level>`), and never carries a model or an effort. In the box `/` and `@` open the pick list (the `/` or `@` row below), which claims `Enter` and `Esc` while it is open / fold (`z`) or expand the selected row's fork lineage (fold an open one, open a folded `(+N)` head, nothing otherwise — see [`App::toggle_selected_lineage`]) / move the selected session to another worktree of the launch project (the parent folder included, its own folder omitted): opens a picker, see the next row; refused, with no picker, while that session's own move, quick reply or headless fork is still in flight / `↓` opens a subagent's own transcript in the preview — the SUBAGENT VIEW (the `◆ delegated to …` click row below) — on the first RUNNING subagent in launch order (unfinished and not failed, and it or a subagent it launched wrote in the last 10 minutes), else the most recently written one, and, pressed again in the view, leaves it as `Esc` does; a typed query stays. It reads no file: the selected session's subagents are read in the background whenever the selection moves or one of them writes, and `↓` refuses on a sticky status line while that read has not landed, or when the session has none (see [`App::open_subagent_target`]) / `?` opens the key-map modal (the terminal-independent twin of `F1`) (any other key cancels) |
 //! | `Enter` in the move picker | move the session to the chosen worktree; the board stays up. A worker thread re-reads the transcript, refuses a session claude lists as active — and, unlike every other gate, refuses too when claude cannot be asked (`claude agents --json` fails; see `crate::claude_move::liveness_refusal`) — then runs one headless `claude -p … -r <id>` in the session's current folder and sends it one `set_cwd` request (see `crate::claude_move`); the status line says `moved to <folder>`, or why not. While it runs the row wears `moving…` and refuses `Enter`, `Ctrl-X f`, `Ctrl-R`, `Ctrl-X d` and another `Ctrl-X w`. On a multi-member lineage's HEAD row `Enter` first opens a `Move this` / `Move lineage (N)` / `Cancel` confirm, highlighted on `Cancel`, disclosing hidden members as the delete confirm does ([`App::open_move_scope_confirm`]); `Move this` is the move above. `Move lineage (N)` is BEST EFFORT: a member snapback is still replying to, forking or moving is skipped, the rest move one at a time on ONE worker, each through the same steps, the run stops at the first `needs_trust` (the target's verdict, shared by every member), every member wears `moving…` until the last finishes, and ONE sticky tally says how many moved and why the rest did not (see `crate::claude_move::status_for_lineage_move`). On a `↳` row or a lone session `Enter` moves at once |
 //! | `Ctrl-L` (in a compose box) | pick the model — and optionally the effort — for THIS compose only: the `Ctrl-R` reply, the `Ctrl-X f` fork or the `Ctrl-N` draft it is pressed in (see [`compose::compose_key_to_action`]). The box's `model:` label names what it runs on: a reply's or fork's default is `session (<model>)`, or `session (<model> · <effort>)` when its last turn recorded a known effort, the model its session last answered with, which claude normally restores by itself (`default` when an `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` override, or a transcript with no answering model, means it would not); a draft's is `default (<value>) (new sessions only)` from the user's `claude` settings. `--model` is sent ONLY for a pick other than that default — on the reply, the fork's `Enter` and `Ctrl-O` run, the draft's background launch and the draft's `Ctrl-O` run — and the default's own effort goes out alone as `--effort` on the first three, when the box shows one. The picker's first row returns to the default, `Enter` sets the highlighted row into the compose, `Esc` returns with the text and the previous pick intact. Every new compose starts at its default; nothing is remembered. `Enter` (resume), the Attach/Fork choice's Fork, Attach and the `Ctrl-X w` move never send a model or an effort |
 //! | `Left` / `Right` (in the model picker) | step the highlighted MODEL row's `--effort` down / up through unset → `low` → `medium` → `high` → `xhigh` → `max`, wrapping both ways; `Enter` then sets the model and the effort together into the compose. Inert on the picker's default row (no model, so no effort) and on every other list modal, so the agent picker keeps ignoring them; they never reach the board's search caret underneath |
+//! | `Ctrl-V` (in a compose box) | ATTACH what the OS clipboard holds, in the `Ctrl-R` reply, the `Ctrl-X f` fork and the `Ctrl-N` draft alike: copied file(s) of any type first, each referenced in place and shown in the draft as the attachment placeholder `[<file name> #N]`; else an image (PNG, JPEG, GIF or WebP), saved under `$SNAPBACK_CONFIG_DIR/cache/paste/` and shown as `[Image #N]`. `N` counts up across the board session (`App::attachment_number`), and the sent message carries each placeholder still in the draft as `@"<absolute path>"`, the mention claude attaches (`compose::expand_attachments`, at every send). The read runs on a worker thread (see [`compose::take_clipboard_read`]); the box shows `attaching…` meanwhile. A result that attaches nothing leaves the draft as it was and refuses in its own words, sticky: a text-only clipboard (naming the terminal's own paste), an empty clipboard, an unsupported image format, an image over 25 MiB, SSH, no display, a missing tool (naming `wl-clipboard` / `xclip`), and a failed read (a timeout, a tool error, an unfinished or over-cap listing, an empty or unwritable image). A path no mention can carry is named with its cause: a copied file, while the other files still go in, or the image's own cache path, in which case nothing is saved. Copied files that attach are confirmed by a transient status, `attached "<full path>"` of the first (quoted and escaped the way Rust's `Debug` escapes a string, the rule being DOMAIN.md's; the line may further hide characters that draw with zero width, and is cut at the terminal width) plus ` (+N more)` for several (`compose::attached_status`), never over a sticky refusal; an image gets none. One attach at a time: `Ctrl-V` or an empty paste while another is still reading only nudges, and so do `Enter`, which sends, forks or launches nothing until the read lands, and the fork's and the draft's `Ctrl-O`, which hands off nothing until then (see [`compose::submit_waits_for_attach`]; a reply's `Ctrl-O` stays inert); the silent `Cmd+V` file check (the terminal paste row) never holds `Enter` or `Ctrl-O`, and a `Ctrl-V` or an empty paste supersedes it. `Esc` while the box's own read is pending cancels THAT read and keeps the box, its draft byte-identical, with a transient nudge (`compose::ATTACH_CANCELLED_HINT`); the read's late result is dropped as a stale token, and a second `Esc` cancels the box (see [`compose::esc_cancels_attach`]). An open pick list still takes `Esc` first, and the silent file check is no read to cancel: there `Esc` cancels the box as always. Shadows the editor's `Ctrl-V` page-down on purpose (see [`compose::compose_key_to_action`]) |
 //! | `/` or `@` (in a compose box) | open the pick list — the SAME list in the `Ctrl-R` reply, the `Ctrl-X f` fork and the `Ctrl-N` draft, which differ only in where it reads from (`compose::completion_source`). `/` as the draft's first character lists claude's skills and commands for the target's folder; `@` at the start of a word lists files and folders and, for a top-level `@` token only, agents, picked as `@agent-<name>`; a skill, command or agent carries its description. The list is claude's own, fetched once per folder per board off the UI thread (`compose::take_catalog_fetch`); until it lands `/` lists nothing in any box, while `@` lists files and folders at once, a reply's or fork's agents come from its transcript and a draft's wait for the catalog. While the list is open `Up` / `Down` choose, `Enter` / `Tab` pick (a folder reopens the list one level down) and `Esc` closes only the list, never the draft (see [`compose::compose_key_to_action`]) |
 //! | `Shift-Left` / `Shift-Right` | step the pane layout one stop toward a full-width preview / a full-width list, along `0:1 · 1:3 · 1:1 · 3:1 · 1:0` (list:preview; the board starts at `1:1`). A press at either end does nothing. Always — with or without a query, and whatever is marked. The step keeps the reader's place in the preview; leaving `1:0` opens it on the newest turn (see [`App::set_pane_layout`]) |
 //! | `PgUp` / `PgDn` | scroll the preview a page (always) |
@@ -67,7 +70,7 @@
 //! | `Backspace` | delete the query character before the caret (the find bar's, while it is open) |
 //! | `Alt-Backspace` / `Ctrl-W` / `Alt-H` | delete the query ATOM before the caret — one whole search word, not one character, so a path or a branch name goes in a single press; what follows the caret stays. THREE keys because `TextArea::input` word-deletes on all three in the compose box: binding the same SET here is what makes the gesture reach the board at all, whatever the user's option-as-meta setting turns `Alt-Backspace` into. The set matches; the EXTENT deliberately does not — the board cuts at the search atom and the compose box at `CharKind`'s punctuation boundary, so `feature/fold-fork-lineages` goes whole here and loses only `lineages` there |
 //! | printable char | type-to-search (insert at the query's caret; the find bar's, while it is open) |
-//! | terminal paste | inserted as TEXT — never as keystrokes (see below); at the find bar's caret while it is open. A compose paste is cut at `send::COMPOSE_PROMPT_MAX_BYTES`; a draft over it is refused, box kept, on `Enter` in every box and on `Ctrl-O` in the fork box and the draft (`compose::refuse_too_long`) |
+//! | terminal paste (`Cmd+V` / `Ctrl-Shift-V`, middle-click) | inserted as TEXT — never as keystrokes (see below); at the find bar's caret while it is open. A compose paste is cut at `send::COMPOSE_PROMPT_MAX_BYTES`; a draft over it is refused, box kept, on `Enter` in every box and on `Ctrl-O` in the fork box and the draft (`compose::refuse_too_long`). In a compose box two cases attach instead: `Cmd+V` of copied FILE(S) in a terminal that pastes their path or name on ONE line is upgraded to their `[<file name> #N]` placeholders, sent as `@"<absolute path>"` mentions, when the clipboard confirms it holds those files and every one of them can be mentioned (a file a mention cannot carry keeps the paste as text, every such file named in a refusal; an upgrade shows the same `attached "<full path>"` status as `Ctrl-V`), and an EMPTY paste (VS Code / Cursor send one for an image-only clipboard) acts as `Ctrl-V`. The clipboard is asked only about a paste shaped like such a path or name ([`compose::paste_may_name_files`]), and the shape is not exact: a pasted bare name holding a space or lacking a lettered extension, and a paste naming a URI scheme other than `file` (`https://`, `mailto:`), are never asked about and stay text, while a few text pastes (a slash command such as `/compact`, a bare `/`, a dotted word such as `example.com`, `a@b.com` or `node.js`) are asked about and stay text |
 //! | mouse: click a folded node's header | unfold the node — a subagent's hand-back (`◆ message from`) or context claude injected (`◇`) — where it sits, and a second click folds it back; a click on a header toggles its node and never opens a link. On the RELEASE, like a link, and ahead of one (see [`click_effect`]). Works while a quick reply or fork box is open, like every pointer action over the transcript but the `◆ delegated to …` switch below |
 //! | mouse: click a `◆ delegated to …` line | switch the preview to that subagent's OWN transcript — the SUBAGENT VIEW: the pane's title names the subagent, its pinned row names the subagent's turn, the board query never marks it (the find bar does), and it updates as the subagent writes. A `◆ delegated to …` line inside it switches to that nested subagent. `Esc` or `Ctrl-X ↓` again goes back to the session's own transcript where it was scrolled; `Ctrl-R` and `Ctrl-X f` leave it too, and so does ANY change of the selected session (`App::set_selected`): `Up` / `Down` while the open view is hidden, the mouse wheel over the list, a search edit, `Tab` or `Ctrl-A` that filters the row out, `Ctrl-X x` or `Ctrl-X h` hiding it, `Ctrl-X d` or `Ctrl-X w` taking it off the board, `Ctrl-X z` from a `↳` row, a reload that drops the row, and the cursor following a headless fork onto its new row. Only this click, `Ctrl-X ↓`, `Left` / `Right` and `Up` / `Down` inside the view open it — no search key does (see [`App::open_subagent_view`]). On the RELEASE, like a link. Refused, on a sticky status line, while a quick reply or fork box is open: what the box sends lands in the session, so the pane keeps showing the session's own transcript |
 //! | mouse: click a preview link | open its url in the browser — `http`/`https` only: any other scheme opens nothing and says so on a sticky status line. On the RELEASE, since only then is it known that the press was a click and not the start of a drag (see [`mouse_effect`]). Works while a quick reply or fork box is open |
@@ -118,16 +121,22 @@
 //!
 //! `tui::init_terminal` enables BRACKETED PASTE, so the terminal hands a clipboard
 //! drop over as ONE [`crossterm::event::Event::Paste`] rather than as a stream of
-//! `KeyEvent`s. There is NO `Ctrl-V` binding and there must not be one: the paste
-//! is the terminal's own (`Cmd+V`, middle-click, …), which keeps working over SSH
-//! and inside tmux where an app-side clipboard read would not.
+//! `KeyEvent`s. TEXT paste is the terminal's own (`Cmd+V` / `Ctrl-Shift-V`,
+//! middle-click, …) and stays so: it keeps working over SSH and inside tmux where
+//! an app-side clipboard read would not. `Ctrl-V` is bound ONLY inside a compose
+//! box, and for what a paste cannot carry — copied files and images, which
+//! snapback reads from the OS clipboard itself (see the `Ctrl-V` row above).
+//! `Cmd+V` can never be a binding: the terminal handles it before any key reaches
+//! the app, so it reaches a compose box only through the paste it produces (an
+//! empty one, or a path-shaped one).
 //!
-//! [`handle_paste`] routes it through the SAME six-owner precedence the key arm
-//! uses, and the row above says only what a compose draft's cap does, because the
-//! interesting part is that routing — the four overlay owners swallow a paste, the
-//! compose zone inserts it at the caret, and the board inserts it at the query's
-//! caret — the find bar's, while it is open — with newlines flattened to spaces.
-//! A paste can never submit, resume, or quit.
+//! [`handle_paste`] routes it through the SAME seven-owner precedence the key arm
+//! uses, and the row above says only what a compose box makes of one (the draft cap,
+//! the two attach cases), because the interesting part is that routing — the five
+//! overlay owners swallow a paste, the compose zone inserts it at the caret, and the
+//! board inserts it at the query's caret — the find bar's, while it is open — with
+//! newlines flattened to spaces, each after clearing the status line as a keypress
+//! does. A paste can never submit, resume, or quit.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -786,7 +795,8 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
                 // showing, Enter/Tab pick, Up/Down move the highlight and Esc closes
                 // only the list; with no list, Enter submits (a reply sends, a fork
                 // forks, a draft launches), Ctrl-J/Alt+Enter add a newline, Esc
-                // cancels and the rest edit the buffer (`compose_key_to_action`).
+                // cancels (the box's own explicit attach first, then the box) and
+                // the rest edit the buffer (`compose_key_to_action`).
                 Some(KeyboardOwner::Compose) => compose::handle_compose_key(app, key),
                 None => {
                     // A transient status (e.g. a resume refusal) lives exactly until
@@ -996,6 +1006,13 @@ fn dispatch(app: &mut App, event: AppEvent, store: &mut SessionStore) -> Outcome
         // terminal's writer. So the result is handed straight back to it (see
         // `Outcome::FinishCopy`), and the status is set there, from this result.
         AppEvent::CopyFinished { payload, copied } => Outcome::FinishCopy { payload, copied },
+        // A compose's clipboard read finished: insert the attachment placeholders,
+        // or say why not.
+        // A result whose token no open compose holds is dropped inside.
+        AppEvent::ClipboardRead { token, result } => {
+            compose::finish_attach(app, token, result);
+            Outcome::Continue
+        }
         AppEvent::CatalogFetched { cwd, listing } => {
             // Delivered ONCE per requested fetch, off-thread, by the catalog worker.
             // Settle it (a `None` is released but never cached), then re-derive an
@@ -1265,7 +1282,10 @@ fn flatten_for_query(text: &str) -> String {
 ///    reason.
 /// 6. **Compose** — INSERTED at the caret as text, via [`compose::insert_paste`].
 ///    This is the fix: the newline inside a paste becomes a newline in the draft
-///    instead of the `Enter` that used to submit it.
+///    instead of the `Enter` that used to submit it. An EMPTY paste acts as
+///    `Ctrl-V` (an attach request), and a one-line paste shaped like a copied
+///    file's path or name ([`compose::paste_may_name_files`]) asks the clipboard
+///    whether to become their attachment placeholders.
 /// 7. **Board** — INSERTED at the search query's caret (the find bar's, while it
 ///    is open), newlines flattened to spaces ([`flatten_for_query`]), exactly as
 ///    if typed.
@@ -1289,7 +1309,19 @@ fn handle_paste(app: &mut App, raw: &str) {
 
     let cap = PasteCap::for_destination(to_compose);
     let accepted = accept_paste(raw, cap);
+    // A paste is an actionable input on either destination: clear the status first,
+    // exactly as a keypress does, so a stale refusal does not outlive it (and, in a
+    // compose box, does not suppress the attach confirmation). An EMPTY paste is
+    // one only in a compose box, where it is `Ctrl-V`; on the board it stays a no-op.
+    if to_compose || !accepted.text.is_empty() {
+        app.clear_status();
+    }
     if accepted.text.is_empty() {
+        // Cmd+V on an image-only clipboard: some terminals (VS Code) send an EMPTY
+        // paste. In a compose box that is `Ctrl-V`; anywhere else it stays a no-op.
+        if to_compose {
+            compose::request_attach(app, compose::AttachPurpose::Explicit, true);
+        }
         return;
     }
 
@@ -1297,10 +1329,9 @@ fn handle_paste(app: &mut App, raw: &str) {
         // Owner 6: the draft takes it verbatim, newlines and all.
         compose::insert_paste(app, &accepted.text);
     } else {
-        // Owner 7: the board. Clear the transient status first, exactly as an
-        // actionable keypress does, so a stale refusal does not outlive this input.
-        // It lands in the find input while that bar is open, as a typed key does.
-        app.clear_status();
+        // Owner 7: the board. The status line was cleared above, exactly as an
+        // actionable keypress does. It lands in the find input while that bar is
+        // open, as a typed key does.
         let text = flatten_for_query(&accepted.text);
         if app.is_finding() {
             app.push_find_str(&text);
@@ -3427,6 +3458,7 @@ mod tests {
 
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use ratatui::backend::TestBackend;
@@ -3731,7 +3763,9 @@ mod tests {
         )
     }
 
-    /// The open compose buffer's text, joined the way a submit would read it.
+    /// The open compose buffer's RAW text, lines joined with `\n`: what the box
+    /// shows, attachment placeholders and all, before `compose::draft` expands them
+    /// for a submit.
     fn draft_text(app: &App) -> String {
         app.compose
             .as_ref()
@@ -3741,16 +3775,23 @@ mod tests {
             .join("\n")
     }
 
+    /// Numbers every [`resumable_session_for_send`] dir. The suite's parallel test
+    /// threads share ONE pid and can read the same clock instant, so without it
+    /// two tests could share a dir and one remove it under the other.
+    static SEND_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
+
     /// A real resumable session file (existing in-file cwd) so `send::plan_send`
-    /// reaches `Ready` at Send time. Returns the `Session` and its temp cwd to
-    /// clean up.
-    fn resumable_session_for_send() -> (Session, PathBuf) {
+    /// reaches `Ready` at Send time, in a dir of its own named by the caller's
+    /// `tag`, [`SEND_DIR_SEQ`], the pid and the time. Returns the `Session` and
+    /// its temp cwd to clean up.
+    fn resumable_session_for_send(tag: &str) -> (Session, PathBuf) {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the unix epoch")
             .as_nanos();
+        let seq = SEND_DIR_SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "snapback-update-send-{}-{nanos}",
+            "snapback-update-send-{tag}-{seq}-{}-{nanos}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("create temp cwd");
@@ -5160,7 +5201,7 @@ mod tests {
     /// `Outcome::Send` for the driver to spawn — the board never tears down.
     #[test]
     fn sending_a_compose_returns_a_send_request_and_clears_compose() {
-        let (session, dir) = resumable_session_for_send();
+        let (session, dir) = resumable_session_for_send("compose-send");
         let mut app = App::new(vec![session], Scope::All, dir.clone());
         seed_live(&mut app, &[]);
         press_ctrl(&mut app, KeyCode::Char('r'));
@@ -5216,7 +5257,7 @@ mod tests {
     /// JSONL line each, after its user turn, and whose cwd holds `notes.txt`,
     /// `src/main.rs` and the session file itself. No catalog has landed.
     fn completion_app_with(records: &[String]) -> (App, PathBuf) {
-        let (session, dir) = resumable_session_for_send();
+        let (session, dir) = resumable_session_for_send("completion");
         let mut text = std::fs::read_to_string(&session.file).expect("read the fixture");
         for record in records {
             text.push('\n');
@@ -5585,7 +5626,7 @@ mod tests {
     /// that waited on it does not.
     #[test]
     fn each_compose_asks_once_for_its_folders_catalog() {
-        let (session, cwd) = resumable_session_for_send();
+        let (session, cwd) = resumable_session_for_send("catalog-cwd");
         let launch = unique_temp_dir("catalog-launch");
         let mut app = App::new(vec![session], Scope::All, launch.clone());
         seed_live(&mut app, &[]);
@@ -5717,7 +5758,7 @@ mod tests {
     /// neither a lost id nor an invented one passes.
     #[test]
     fn a_reply_carries_its_stop_job_into_the_emitted_request() {
-        let (session, dir) = resumable_session_for_send();
+        let (session, dir) = resumable_session_for_send("stop-job");
         let id = session.session_id.clone();
 
         // A `done` background agent: Ctrl-R composes straight away, in
@@ -18512,6 +18553,64 @@ words",
         );
     }
 
+    /// `Ctrl-V`, an EMPTY paste and a paste shaped like a copied file's path are
+    /// each a COMPOSE box's attach request, never the find bar's: with the bar open
+    /// and no box (the bar owns the typing), the key does nothing, the empty paste
+    /// does nothing, and the file-shaped paste is plain text in the bar. None of
+    /// them hands the driver a clipboard read (`compose::take_clipboard_read`) or
+    /// takes an attach token, so no OS clipboard tool ever runs for the bar.
+    #[test]
+    fn the_attach_paths_never_reach_the_find_bar_or_ask_for_a_clipboard_read() {
+        let mut app = find_board();
+        press_ctrl(&mut app, KeyCode::Char('f'));
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(find_text(&app).as_deref(), Some("ab"), "fixture: bar typed");
+        let token = app.attach_token;
+        let assert_no_attach = |app: &mut App, path: &str, bar: &str| {
+            assert!(!app.is_composing(), "{path}: no box opened");
+            assert_eq!(
+                find_text(app).as_deref(),
+                Some(bar),
+                "{path}: the bar's text"
+            );
+            assert_eq!(app.query(), "", "{path}: the board query is untouched");
+            assert_eq!(app.attach_token, token, "{path}: no attach token was taken");
+            assert_eq!(
+                compose::take_clipboard_read(app),
+                None,
+                "{path}: no clipboard read is requested"
+            );
+        };
+
+        // Path 1: the `Ctrl-V` key. Inert outside a compose box, bar open or not.
+        let out = press_ctrl(&mut app, KeyCode::Char('v'));
+        assert!(matches!(out, Outcome::Continue));
+        assert_no_attach(&mut app, "Ctrl-V", "ab");
+        assert_eq!(app.status, None, "Ctrl-V: no status was set");
+
+        // Path 2: the empty bracketed paste `Cmd+V` sends for an image-only clipboard.
+        // On the board it is a no-op, so a standing status is left as it was.
+        app.set_status("a standing refusal");
+        let out = paste(&mut app, "");
+        assert!(matches!(out, Outcome::Continue));
+        assert_no_attach(&mut app, "an empty paste", "ab");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("a standing refusal"),
+            "an empty paste: not an actionable input outside a compose box"
+        );
+
+        // Path 3: a one-line paste a copied file's rendering would be: text to the bar.
+        let out = paste(&mut app, "/tmp/my doc.pdf");
+        assert!(matches!(out, Outcome::Continue));
+        assert_no_attach(&mut app, "a file-shaped paste", "ab/tmp/my doc.pdf");
+        assert_eq!(
+            app.status, None,
+            "a file-shaped paste: text clears the status"
+        );
+    }
+
     /// `Enter` with the bar open never resumes: with ZERO matches it is a no-op
     /// that leaves the bar open and the board where it was, where with the bar
     /// closed it hands the session over.
@@ -18761,6 +18860,1775 @@ words",
         assert!(app.is_composing(), "f opens the fork box");
         assert_eq!(app.filtered, folded, "and does not unfold the lineage");
         assert_eq!(app.query(), "", "and never types into the query");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Ctrl-V / Cmd+V clipboard attach -------------------------------------
+
+    /// Deliver a finished clipboard read through `handle_event`, as the worker does.
+    fn clipboard_read(app: &mut App, token: u64, result: crate::watch::ClipboardAttach) -> Outcome {
+        handle_event(
+            app,
+            AppEvent::ClipboardRead { token, result },
+            &mut store_at(Path::new("/tmp")),
+        )
+    }
+
+    /// `Ctrl-V` in the open compose box, then the token the driver would be handed.
+    fn ctrl_v_token(app: &mut App) -> u64 {
+        press_ctrl(app, KeyCode::Char('v'));
+        compose::take_clipboard_read(app)
+            .expect("Ctrl-V asks the driver to read once")
+            .0
+    }
+
+    #[test]
+    fn ctrl_v_then_an_image_result_inserts_a_placeholder_at_the_caret() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        type_into_draft(&mut app, "see");
+        let token = ctrl_v_token(&mut app);
+        let outcome = clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert_eq!(draft_text(&app), "see [Image #1] ");
+        assert!(
+            app.compose.as_ref().unwrap().completion.visible.is_none(),
+            "an inserted placeholder must not read as an open @ token"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_files_result_inserts_every_placeholder() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        let token = ctrl_v_token(&mut app);
+        clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec!["/tmp/a b.pdf".into(), "/tmp/c.txt".into()]),
+        );
+        assert_eq!(draft_text(&app), "[a b.pdf #1] [c.txt #2] ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_non_attaching_result_leaves_the_draft_byte_identical_and_says_why() {
+        use crate::watch::ClipboardAttach as C;
+        for result in [
+            C::TextOnly,
+            C::Nothing,
+            C::UnsupportedImage,
+            C::TooLarge,
+            C::RemoteSession,
+            C::NoDisplay,
+            C::NoTool,
+            C::Failed,
+        ] {
+            let (mut app, dir) = completion_app(&[]);
+            type_into_draft(&mut app, "keep me");
+            let token = ctrl_v_token(&mut app);
+            let outcome = clipboard_read(&mut app, token, result.clone());
+            assert!(matches!(outcome, Outcome::Continue), "{result:?}");
+            assert_eq!(draft_text(&app), "keep me", "{result:?}");
+            assert!(
+                app.status.as_deref().is_some_and(|s| !s.is_empty()),
+                "{result:?} must name its refusal"
+            );
+            assert!(app.compose.as_ref().unwrap().pending_attach.is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_stale_token_is_dropped_and_the_new_draft_is_untouched() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        let old = ctrl_v_token(&mut app);
+        // The first `Esc` cancels the pending read, the second the box.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing());
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        type_into_draft(&mut app, "new");
+        let fresh = ctrl_v_token(&mut app);
+        assert_ne!(old, fresh, "every request gets its own token");
+        clipboard_read(&mut app, old, ClipboardAttach::Image("/tmp/p.png".into()));
+        assert_eq!(draft_text(&app), "new");
+        assert!(
+            app.compose.as_ref().unwrap().pending_attach.is_some(),
+            "the stale result must not settle the new draft's own request"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_paste_requests_an_attach_while_composing_and_is_a_no_op_on_the_board() {
+        let (mut app, dir) = completion_app(&[]);
+        paste(&mut app, "");
+        let pending = app.compose.as_ref().unwrap().pending_attach.as_ref();
+        assert!(matches!(
+            pending.map(|p| &p.purpose),
+            Some(compose::AttachPurpose::Explicit)
+        ));
+        assert_eq!(draft_text(&app), "");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut board = app_with("s1", None);
+        paste(&mut board, "");
+        assert!(board.compose.is_none());
+        assert_eq!(board.query(), "");
+    }
+
+    #[test]
+    fn a_file_shaped_paste_stays_verbatim_and_upgrades_only_on_a_matching_untouched_draft() {
+        use crate::watch::ClipboardAttach;
+        let files = || ClipboardAttach::Files(vec!["/tmp/my doc.pdf".into()]);
+        let pasted = |app: &mut App| {
+            paste(app, "/tmp/my doc.pdf");
+            assert_eq!(draft_text(app), "/tmp/my doc.pdf");
+            compose::take_clipboard_read(app)
+                .expect("a path-shaped paste asks the clipboard")
+                .0
+        };
+
+        let (mut app, dir) = completion_app(&[]);
+        let token = pasted(&mut app);
+        clipboard_read(&mut app, token, files());
+        assert_eq!(draft_text(&app), "[my doc.pdf #1] ");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (mut app, dir) = completion_app(&[]);
+        let token = pasted(&mut app);
+        type_into_draft(&mut app, "!");
+        clipboard_read(&mut app, token, files());
+        assert_eq!(draft_text(&app), "/tmp/my doc.pdf!");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (mut app, dir) = completion_app(&[]);
+        let token = pasted(&mut app);
+        clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec!["/tmp/other.pdf".into()]),
+        );
+        assert_eq!(draft_text(&app), "/tmp/my doc.pdf");
+        assert_eq!(app.status, None, "an ordinary paste is not announced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A paste into a compose box is an actionable input, as a key and a board
+    /// paste are: a sticky refusal left on the line does not outlive it, and a
+    /// truncated paste's own nudge, set after the clear, still shows.
+    #[test]
+    fn a_compose_paste_clears_a_sticky_status_before_it_inserts() {
+        let (mut app, dir) = completion_app(&[]);
+        app.set_status("an earlier refusal");
+        paste(&mut app, "hello");
+        assert_eq!(draft_text(&app), "hello");
+        assert_eq!(
+            app.status, None,
+            "the stale refusal must not outlive a paste"
+        );
+
+        app.set_status("an earlier refusal");
+        paste(&mut app, &"x".repeat(send::COMPOSE_PROMPT_MAX_BYTES + 100));
+        assert_transient_truncated(&app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An EMPTY paste that a compose box turns into an attach request is an
+    /// actionable input too (`Ctrl-V` clears first): a stale refusal neither hides
+    /// the copied-file confirmation nor outlives an image that landed. A board's
+    /// empty paste is a no-op and leaves the line alone.
+    #[test]
+    fn an_empty_compose_paste_clears_a_sticky_status_like_ctrl_v() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        app.set_status("an earlier refusal");
+        paste(&mut app, "");
+        let token = compose::take_clipboard_read(&mut app)
+            .expect("an empty paste asks the clipboard")
+            .0;
+        clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec!["/tmp/a.pdf".into()]),
+        );
+        assert_eq!(app.status.as_deref(), Some("attached \"/tmp/a.pdf\""));
+
+        app.set_status("an earlier refusal");
+        paste(&mut app, "");
+        let token = compose::take_clipboard_read(&mut app)
+            .expect("an empty paste asks the clipboard")
+            .0;
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        assert_eq!(
+            app.status, None,
+            "a stale refusal must not outlive an image"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut board = app_with("s1", None);
+        board.set_status("an earlier refusal");
+        paste(&mut board, "");
+        assert_eq!(board.status.as_deref(), Some("an earlier refusal"));
+    }
+
+    /// The board half of the shared clear: a NON-EMPTY paste with no compose box
+    /// open is an actionable input, so a stale refusal does not outlive it, and the
+    /// text still lands in the search query. (The empty board paste leaves the line
+    /// alone; `an_empty_compose_paste_clears_a_sticky_status_like_ctrl_v` pins that.)
+    #[test]
+    fn a_board_paste_clears_a_sticky_status_and_fills_the_query() {
+        let mut app = app_with("s1", None);
+        assert!(!app.is_composing(), "the board owns this paste");
+        app.set_status("an earlier refusal");
+        paste(&mut app, "hello");
+        assert_eq!(app.query(), "hello");
+        assert_eq!(
+            app.status, None,
+            "the stale refusal must not outlive a board paste"
+        );
+    }
+
+    fn assert_transient_truncated(app: &App) {
+        assert_eq!(
+            app.status.as_deref(),
+            Some(paste_truncated_status(PasteCap::Bytes(send::COMPOSE_PROMPT_MAX_BYTES)).as_str()),
+            "the truncation nudge is set AFTER the clear, so it survives"
+        );
+        assert_eq!(app.status_ttl, Some(STATUS_DWELL_TICKS));
+    }
+
+    /// The copied-file confirmation is not hidden by a refusal left from an earlier
+    /// input: the paste that asks for the upgrade clears it first.
+    #[test]
+    fn a_stale_refusal_does_not_hide_a_cmd_v_upgrade_confirmation() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        app.set_status("an earlier refusal");
+        paste(&mut app, "/tmp/my doc.pdf");
+        let token = compose::take_clipboard_read(&mut app)
+            .expect("a path-shaped paste asks the clipboard")
+            .0;
+        clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec!["/tmp/my doc.pdf".into()]),
+        );
+        assert_eq!(draft_text(&app), "[my doc.pdf #1] ");
+        assert_eq!(app.status.as_deref(), Some("attached \"/tmp/my doc.pdf\""));
+        assert_eq!(app.status_ttl, Some(STATUS_DWELL_TICKS));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_placeholder_after_a_word_gets_a_leading_space() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        type_into_draft(&mut app, "word");
+        let token = ctrl_v_token(&mut app);
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        assert!(
+            draft_text(&app).starts_with("word [Image #1]"),
+            "{}",
+            draft_text(&app)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_multi_line_paste_never_requests_an_upgrade() {
+        let (mut app, dir) = completion_app(&[]);
+        paste(&mut app, "/tmp/a.png\n/tmp/b.png");
+        assert!(app.compose.as_ref().unwrap().pending_attach.is_none());
+        assert_eq!(compose::take_clipboard_read(&mut app), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An attachment's placeholder plus text reaches `claude` expanded into its
+    /// mention, as ONE trailing argv element built by the unchanged
+    /// `send::build_send_argv`.
+    #[test]
+    fn a_reply_with_an_attachment_sends_its_mention_inside_the_last_argv_element() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        type_into_draft(&mut app, "what is this?");
+        let token = ctrl_v_token(&mut app);
+        clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Image("/tmp/p q.png".into()),
+        );
+        let message = "what is this? @\"/tmp/p q.png\" ";
+        assert_eq!(draft_text(&app), "what is this? [Image #1] ");
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter with the list closed must send");
+        };
+        assert_eq!(
+            req.argv,
+            crate::send::build_send_argv("sess-send-e2e", None, None, message)
+        );
+        assert_eq!(req.argv.last().map(String::as_str), Some(message));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- the same attach in the `Ctrl-X f` fork box --------------------------
+
+    /// A FORK box opened through the board's own `Ctrl-X f` on a real session, so the
+    /// attach below reaches the fork target by the user's path, not a constructor.
+    fn fork_box_app() -> (App, PathBuf) {
+        let (session, dir) = resumable_session_for_send("fork-box");
+        let mut app = App::new(vec![session], Scope::All, dir.clone());
+        press_fork(&mut app);
+        assert!(
+            matches!(
+                app.compose.as_ref().map(|c| &c.target),
+                Some(ComposeTarget::Fork { .. })
+            ),
+            "the fork box must really open, or this proves nothing"
+        );
+        (app, dir)
+    }
+
+    /// The pending attach of the open compose, by purpose.
+    fn pending_purpose(app: &App) -> Option<compose::AttachPurpose> {
+        app.compose
+            .as_ref()
+            .and_then(|c| c.pending_attach.as_ref())
+            .map(|p| p.purpose.clone())
+    }
+
+    #[test]
+    fn ctrl_v_in_a_fork_box_requests_one_explicit_attach() {
+        use crate::tui::clipboard::ReadMode;
+        let (mut app, dir) = fork_box_app();
+        assert!(matches!(
+            press_ctrl(&mut app, KeyCode::Char('v')),
+            Outcome::Continue
+        ));
+        assert_eq!(
+            pending_purpose(&app),
+            Some(compose::AttachPurpose::Explicit)
+        );
+        let (token, mode) =
+            compose::take_clipboard_read(&mut app).expect("Ctrl-V asks the driver to read");
+        assert_eq!(mode, ReadMode::Attach);
+        assert_eq!(
+            app.compose
+                .as_ref()
+                .and_then(|c| c.pending_attach.as_ref())
+                .map(|p| p.token),
+            Some(token)
+        );
+        assert_eq!(
+            compose::take_clipboard_read(&mut app),
+            None,
+            "the driver is handed the read once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_image_result_lands_in_the_fork_box_and_its_enter_sends_it() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = fork_box_app();
+        type_into_draft(&mut app, "fork with");
+        let token = ctrl_v_token(&mut app);
+        let outcome = clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        assert!(matches!(outcome, Outcome::Continue));
+        let message = "fork with @\"/tmp/p.png\" ";
+        assert_eq!(draft_text(&app), "fork with [Image #1] ");
+        assert!(pending_purpose(&app).is_none(), "the read is settled");
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter on a typed fork box must send");
+        };
+        assert!(req.argv.iter().any(|a| a == "--fork-session"));
+        assert_eq!(req.argv.last().map(String::as_str), Some(message));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_paste_in_a_fork_box_requests_an_explicit_attach() {
+        use crate::tui::clipboard::ReadMode;
+        let (mut app, dir) = fork_box_app();
+        paste(&mut app, "");
+        assert_eq!(
+            pending_purpose(&app),
+            Some(compose::AttachPurpose::Explicit)
+        );
+        assert_eq!(draft_text(&app), "");
+        assert_eq!(
+            compose::take_clipboard_read(&mut app).map(|(_, mode)| mode),
+            Some(ReadMode::Attach)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_shaped_paste_in_a_fork_box_upgrades_on_a_matching_files_result() {
+        use crate::tui::clipboard::ReadMode;
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = fork_box_app();
+        paste(&mut app, "/tmp/my doc.pdf");
+        assert_eq!(draft_text(&app), "/tmp/my doc.pdf");
+        assert!(
+            matches!(
+                pending_purpose(&app),
+                Some(compose::AttachPurpose::Upgrade { .. })
+            ),
+            "a path-shaped paste asks the clipboard to confirm"
+        );
+        let (token, mode) =
+            compose::take_clipboard_read(&mut app).expect("the upgrade check is handed over");
+        assert_eq!(mode, ReadMode::ListOnly);
+        clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec!["/tmp/my doc.pdf".into()]),
+        );
+        assert_eq!(draft_text(&app), "[my doc.pdf #1] ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- `Enter` and `Ctrl-O` wait for the box's own explicit read ------------
+
+    /// A submit key (`submit`) in the open box while its EXPLICIT read is pending:
+    /// nothing is dispatched, the box, its draft and the pending read (token,
+    /// requested flag and all) stay exactly as they were, and the key's own
+    /// TRANSIENT nudge (`hint`) says why.
+    fn assert_submit_waits_for_the_read(
+        app: &mut App,
+        submit: fn(&mut App) -> Outcome,
+        hint: &str,
+    ) {
+        let draft = draft_text(app);
+        let pending = app.compose.as_ref().and_then(|c| c.pending_attach.clone());
+        assert!(
+            pending
+                .as_ref()
+                .is_some_and(compose::PendingAttach::shows_mark),
+            "an explicit read must be pending, or this proves nothing"
+        );
+        let out = submit(app);
+        assert!(
+            matches!(out, Outcome::Continue),
+            "the key dispatches nothing while the box is attaching"
+        );
+        assert!(app.is_composing(), "the box stays open");
+        assert_eq!(draft_text(app), draft, "the draft is untouched");
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.pending_attach.clone()),
+            pending,
+            "the pending read is untouched"
+        );
+        assert_eq!(app.status.as_deref(), Some(hint));
+        assert_eq!(
+            app.status_ttl,
+            Some(STATUS_DWELL_TICKS),
+            "a nudge expires, it is no refusal"
+        );
+        assert!(app.sending.is_empty(), "nothing is in flight");
+    }
+
+    fn assert_enter_waits_for_the_read(app: &mut App) {
+        assert_submit_waits_for_the_read(
+            app,
+            |app| press(app, KeyCode::Enter),
+            compose::ENTER_WHILE_ATTACHING_HINT,
+        );
+    }
+
+    fn assert_ctrl_o_waits_for_the_read(app: &mut App) {
+        assert_submit_waits_for_the_read(
+            app,
+            |app| press_ctrl(app, KeyCode::Char('o')),
+            compose::CTRL_O_WHILE_ATTACHING_HINT,
+        );
+    }
+
+    #[test]
+    fn enter_in_a_reply_box_waits_for_its_ctrl_v_then_sends_the_attachment() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        type_into_draft(&mut app, "see");
+        let token = ctrl_v_token(&mut app);
+        assert_enter_waits_for_the_read(&mut app);
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("once the read has landed, Enter sends");
+        };
+        assert_eq!(
+            req.argv.last().map(String::as_str),
+            Some("see @\"/tmp/p.png\" ")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_in_a_fork_box_waits_for_its_ctrl_v_then_forks_with_the_attachment() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = fork_box_app();
+        type_into_draft(&mut app, "fork with");
+        let token = ctrl_v_token(&mut app);
+        assert_enter_waits_for_the_read(&mut app);
+        assert!(app.fork_jump.is_none(), "no fork was dispatched");
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("once the read has landed, Enter forks");
+        };
+        assert!(req.argv.iter().any(|a| a == "--fork-session"));
+        assert_eq!(
+            req.argv.last().map(String::as_str),
+            Some("fork with @\"/tmp/p.png\" ")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The draft asks through the OTHER explicit route, an empty paste (`Cmd+V` of
+    /// an image where the terminal sends one), which holds `Enter` the same way.
+    #[test]
+    fn enter_in_a_draft_waits_for_its_empty_paste_read_then_launches_with_the_attachment() {
+        use crate::watch::ClipboardAttach;
+        let dir = unique_temp_dir("enter-waits-draft");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        compose::open_background(&mut app, None);
+        type_into_draft(&mut app, "look");
+        paste(&mut app, "");
+        let (token, _) =
+            compose::take_clipboard_read(&mut app).expect("the empty paste asks the driver");
+        assert_enter_waits_for_the_read(&mut app);
+        assert_eq!(
+            app.draft.as_ref().and_then(|d| d.launch_id),
+            None,
+            "no launch was dispatched"
+        );
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        let Outcome::BgLaunch(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("once the read has landed, Enter launches");
+        };
+        assert_eq!(
+            req.argv.last().map(String::as_str),
+            Some("look @\"/tmp/p.png\" ")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The silent copied-file check NEVER holds `Enter`: the paste sends exactly as
+    /// typed, and the check's late result, whose compose is gone, changes nothing.
+    #[test]
+    fn a_silent_file_check_never_holds_enter() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        type_into_draft(&mut app, "see ");
+        paste(&mut app, "/tmp/my doc.pdf");
+        assert!(
+            matches!(
+                pending_purpose(&app),
+                Some(compose::AttachPurpose::Upgrade { .. })
+            ),
+            "the paste must have asked the clipboard silently, or this proves nothing"
+        );
+        let (token, _) = compose::take_clipboard_read(&mut app).expect("the check is handed over");
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("a silent check must never hold Enter");
+        };
+        assert_eq!(
+            req.argv.last().map(String::as_str),
+            Some("see /tmp/my doc.pdf")
+        );
+        assert_ne!(
+            app.status.as_deref(),
+            Some(compose::ENTER_WHILE_ATTACHING_HINT)
+        );
+        let late = clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec!["/tmp/my doc.pdf".into()]),
+        );
+        assert!(matches!(late, Outcome::Continue));
+        assert!(!app.is_composing(), "the late result reopens nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_o_in_a_fork_box_waits_for_its_ctrl_v_then_runs_with_the_attachment() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = fork_box_app();
+        type_into_draft(&mut app, "fork with");
+        let token = ctrl_v_token(&mut app);
+        assert_ctrl_o_waits_for_the_read(&mut app);
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        let Outcome::Resume(ready) = press_ctrl(&mut app, KeyCode::Char('o')) else {
+            panic!("once the read has landed, Ctrl-O forks: {:?}", app.status);
+        };
+        assert!(ready.argv.iter().any(|a| a == "--fork-session"));
+        assert_eq!(
+            ready.argv.last().map(String::as_str),
+            Some("fork with @\"/tmp/p.png\" ")
+        );
+        assert!(!app.is_composing(), "handing off closes the box");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The draft asks through the OTHER explicit route, an empty paste, which holds
+    /// `Ctrl-O` the same way.
+    #[test]
+    fn ctrl_o_in_a_draft_waits_for_its_empty_paste_read_then_runs_with_the_attachment() {
+        use crate::watch::ClipboardAttach;
+        let dir = unique_temp_dir("ctrl-o-waits-draft");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        compose::open_background(&mut app, None);
+        type_into_draft(&mut app, "look");
+        paste(&mut app, "");
+        let (token, _) =
+            compose::take_clipboard_read(&mut app).expect("the empty paste asks the driver");
+        assert_ctrl_o_waits_for_the_read(&mut app);
+        assert!(
+            app.draft.is_some(),
+            "the card stays: nothing was handed off"
+        );
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        let Outcome::Resume(ready) = press_ctrl(&mut app, KeyCode::Char('o')) else {
+            panic!("once the read has landed, Ctrl-O runs: {:?}", app.status);
+        };
+        assert!(!ready.argv.iter().any(|a| a == "--bg"));
+        assert_eq!(
+            ready.argv.last().map(String::as_str),
+            Some("look @\"/tmp/p.png\" ")
+        );
+        assert!(!app.is_composing(), "handing off closes the draft");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The silent copied-file check NEVER holds `Ctrl-O`, in the fork box or the
+    /// draft: the paste runs exactly as typed, and the check's late result, whose
+    /// compose is gone, changes nothing.
+    #[test]
+    fn a_silent_file_check_never_holds_ctrl_o() {
+        use crate::watch::ClipboardAttach;
+        let runs_past_the_check = |app: &mut App| {
+            type_into_draft(app, "see ");
+            paste(app, "/tmp/my doc.pdf");
+            assert!(
+                matches!(
+                    pending_purpose(app),
+                    Some(compose::AttachPurpose::Upgrade { .. })
+                ),
+                "the paste must have asked the clipboard silently, or this proves nothing"
+            );
+            let (token, _) = compose::take_clipboard_read(app).expect("the check is handed over");
+            let Outcome::Resume(ready) = press_ctrl(app, KeyCode::Char('o')) else {
+                panic!("a silent check must never hold Ctrl-O: {:?}", app.status);
+            };
+            assert_eq!(
+                ready.argv.last().map(String::as_str),
+                Some("see /tmp/my doc.pdf")
+            );
+            assert_ne!(
+                app.status.as_deref(),
+                Some(compose::CTRL_O_WHILE_ATTACHING_HINT)
+            );
+            let late = clipboard_read(
+                app,
+                token,
+                ClipboardAttach::Files(vec!["/tmp/my doc.pdf".into()]),
+            );
+            assert!(matches!(late, Outcome::Continue));
+            assert!(!app.is_composing(), "the late result reopens nothing");
+        };
+
+        let (mut app, dir) = fork_box_app();
+        runs_past_the_check(&mut app);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = unique_temp_dir("ctrl-o-silent-draft");
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        compose::open_background(&mut app, None);
+        runs_past_the_check(&mut app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reply's `Ctrl-O` stays the no-op it always was, even while its explicit
+    /// read is pending: no nudge, no hand-off, draft and read untouched.
+    #[test]
+    fn a_reply_box_ctrl_o_stays_inert_while_its_ctrl_v_reads() {
+        let (mut app, dir) = completion_app(&[]);
+        type_into_draft(&mut app, "see");
+        ctrl_v_token(&mut app);
+        let pending = app.compose.as_ref().and_then(|c| c.pending_attach.clone());
+        let out = press_ctrl(&mut app, KeyCode::Char('o'));
+        assert!(matches!(out, Outcome::Continue));
+        assert!(app.is_composing(), "the reply box stays open");
+        assert_eq!(draft_text(&app), "see");
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.pending_attach.clone()),
+            pending,
+            "the pending read is untouched"
+        );
+        assert_eq!(app.status, None, "an inert key nudges nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- `Esc` cancels the box's own explicit read before the box -------------
+
+    /// The three compose boxes, each on a folder of its own holding a `notes.txt`
+    /// its `@` lists: a `Ctrl-R` reply and a `Ctrl-X f` fork opened by the board's own
+    /// keys on a real session, and a `Ctrl-N` draft. `tag` names the folders, so
+    /// tests running in parallel never share (and delete) one. Each comes with its
+    /// name and the dir to remove.
+    fn each_compose_box(tag: &str) -> Vec<(&'static str, App, PathBuf)> {
+        let session_box = |name: &'static str, open: fn(&mut App) -> Outcome| {
+            let dir = unique_temp_dir(&format!("{tag}-{name}"));
+            std::fs::write(dir.join("notes.txt"), "n").expect("write notes");
+            let session = resumable_session_in(&dir, "sess-esc", "esc");
+            let mut app = App::new(vec![session], Scope::All, dir.clone());
+            seed_live(&mut app, &[]);
+            open(&mut app);
+            let opened = match app.compose.as_ref().map(|c| &c.target) {
+                Some(ComposeTarget::Reply { .. }) => "reply",
+                Some(ComposeTarget::Fork { .. }) => "fork",
+                _ => "no box",
+            };
+            assert_eq!(
+                opened, name,
+                "the box must really open, or this proves nothing"
+            );
+            (name, app, dir)
+        };
+        let reply = session_box("reply", |app| press_ctrl(app, KeyCode::Char('r')));
+        let fork = session_box("fork", press_fork);
+        let draft_dir = unique_temp_dir(&format!("{tag}-draft"));
+        std::fs::write(draft_dir.join("notes.txt"), "n").expect("write notes");
+        let mut draft = App::new(Vec::new(), Scope::All, draft_dir.clone());
+        compose::open_background(&mut draft, None);
+        vec![reply, fork, ("draft", draft, draft_dir)]
+    }
+
+    /// The open draft's text and caret.
+    fn draft_and_caret(app: &App) -> (String, (usize, usize)) {
+        let caret = app
+            .compose
+            .as_ref()
+            .expect("compose is open")
+            .textarea
+            .cursor();
+        (draft_text(app), (caret.0, caret.1))
+    }
+
+    /// In every box, `Esc` while its own `Ctrl-V` reads cancels THAT read: the box
+    /// and its draft, caret included, stay exactly as they were, a transient nudge
+    /// says so, and the read's late result is dropped. A second `Esc` cancels the
+    /// box.
+    #[test]
+    fn esc_cancels_a_reading_attach_first_and_keeps_the_draft_in_every_box() {
+        use crate::watch::ClipboardAttach;
+        for (name, mut app, dir) in each_compose_box("esc-cancels-read") {
+            type_into_draft(&mut app, "keep\nme ");
+            let token = ctrl_v_token(&mut app);
+            let before = draft_and_caret(&app);
+
+            let out = press(&mut app, KeyCode::Esc);
+            assert!(matches!(out, Outcome::Continue), "{name}");
+            assert!(app.is_composing(), "{name}: the box stays open");
+            assert_eq!(draft_and_caret(&app), before, "{name}: the draft is kept");
+            assert!(
+                pending_purpose(&app).is_none(),
+                "{name}: the read is dropped"
+            );
+            assert_eq!(
+                app.status.as_deref(),
+                Some(compose::ATTACH_CANCELLED_HINT),
+                "{name}"
+            );
+            assert_eq!(
+                app.status_ttl,
+                Some(STATUS_DWELL_TICKS),
+                "{name}: a nudge expires"
+            );
+            assert_eq!(compose::take_clipboard_read(&mut app), None, "{name}");
+
+            let late = clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+            assert!(matches!(late, Outcome::Continue), "{name}");
+            assert_eq!(
+                draft_and_caret(&app),
+                before,
+                "{name}: the cancelled read's late result is dropped"
+            );
+
+            let out = press(&mut app, KeyCode::Esc);
+            assert!(matches!(out, Outcome::Continue), "{name}");
+            assert!(
+                !app.is_composing(),
+                "{name}: the second Esc cancels the box"
+            );
+            assert!(app.draft.is_none(), "{name}: no card is left behind");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// In every box the silent copied-file check is no attach to cancel: `Esc`
+    /// cancels the box at once, as it always did.
+    #[test]
+    fn esc_with_only_a_silent_file_check_pending_cancels_the_box_in_every_box() {
+        for (name, mut app, dir) in each_compose_box("esc-silent-check") {
+            paste(&mut app, "/tmp/my doc.pdf");
+            assert!(
+                matches!(
+                    pending_purpose(&app),
+                    Some(compose::AttachPurpose::Upgrade { .. })
+                ),
+                "{name}: the paste must have asked silently, or this proves nothing"
+            );
+            compose::take_clipboard_read(&mut app).expect("the check is handed over");
+            let out = press(&mut app, KeyCode::Esc);
+            assert!(matches!(out, Outcome::Continue), "{name}");
+            assert!(!app.is_composing(), "{name}: Esc cancels the box");
+            assert_ne!(
+                app.status.as_deref(),
+                Some(compose::ATTACH_CANCELLED_HINT),
+                "{name}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// In every box `Esc` unwinds one layer per press: an open pick list first,
+    /// with the read still pending; then the read, with the draft kept; then the
+    /// box.
+    #[test]
+    fn esc_closes_an_open_pick_list_before_a_reading_attach_in_every_box() {
+        for (name, mut app, dir) in each_compose_box("esc-list-first") {
+            type_into_draft(&mut app, "@");
+            assert!(
+                list_open(&app),
+                "{name}: the `@` list must show, or this proves nothing"
+            );
+            ctrl_v_token(&mut app);
+            assert!(list_open(&app), "{name}: Ctrl-V leaves the list open");
+            let pending = app.compose.as_ref().and_then(|c| c.pending_attach.clone());
+            let before = draft_and_caret(&app);
+
+            press(&mut app, KeyCode::Esc);
+            assert!(!list_open(&app), "{name}: the first Esc closes the list");
+            assert_eq!(
+                app.compose.as_ref().and_then(|c| c.pending_attach.clone()),
+                pending,
+                "{name}: the read stays pending"
+            );
+            assert_eq!(app.status, None, "{name}: closing the list says nothing");
+
+            press(&mut app, KeyCode::Esc);
+            assert!(app.is_composing(), "{name}");
+            assert!(
+                pending_purpose(&app).is_none(),
+                "{name}: the second Esc drops the read"
+            );
+            assert_eq!(draft_and_caret(&app), before, "{name}: the draft is kept");
+
+            press(&mut app, KeyCode::Esc);
+            assert!(!app.is_composing(), "{name}: the third Esc cancels the box");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // --- a dropped `Image` result queues its cache file for the driver ---------
+    //
+    // These only RECORD a path (literal, never created): the delete is the
+    // driver's, on its own thread, and pinned in `clipboard`'s tests.
+
+    /// In every box, the late `Image` of a read `Esc` cancelled is queued for the
+    /// driver to delete, and the kept draft, caret included, stays byte-identical.
+    #[test]
+    fn an_esc_cancelled_reads_late_image_is_queued_and_the_draft_is_kept_in_every_box() {
+        use crate::watch::ClipboardAttach;
+        for (name, mut app, dir) in each_compose_box("discard-esc") {
+            type_into_draft(&mut app, "keep\nme ");
+            let token = ctrl_v_token(&mut app);
+            press(&mut app, KeyCode::Esc);
+            assert!(
+                app.is_composing() && pending_purpose(&app).is_none(),
+                "{name}: Esc must cancel only the read, or this proves nothing"
+            );
+            let before = draft_and_caret(&app);
+
+            clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+
+            assert_eq!(draft_and_caret(&app), before, "{name}: the draft is kept");
+            assert_eq!(
+                compose::take_stale_paste_images(&mut app),
+                vec![PathBuf::from("/tmp/p.png")],
+                "{name}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A stale token reaching a NEWER compose queues its image, and leaves the new
+    /// draft and its own pending read exactly as they were.
+    #[test]
+    fn a_stale_tokens_image_is_queued_and_the_new_draft_is_untouched() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        let old = ctrl_v_token(&mut app);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing(), "the box must be closed");
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        type_into_draft(&mut app, "new");
+        ctrl_v_token(&mut app);
+        let before = draft_and_caret(&app);
+        let pending = app.compose.as_ref().and_then(|c| c.pending_attach.clone());
+
+        clipboard_read(&mut app, old, ClipboardAttach::Image("/tmp/old.png".into()));
+
+        assert_eq!(draft_and_caret(&app), before, "the new draft is untouched");
+        assert_eq!(
+            app.compose.as_ref().and_then(|c| c.pending_attach.clone()),
+            pending,
+            "the new draft's own read stays pending"
+        );
+        assert_eq!(
+            compose::take_stale_paste_images(&mut app),
+            vec![PathBuf::from("/tmp/old.png")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With no compose open, a late `Image` is queued and reopens nothing.
+    #[test]
+    fn an_image_arriving_with_no_compose_open_is_queued() {
+        use crate::watch::ClipboardAttach;
+        let mut app = app_with("s1", None);
+        let outcome = clipboard_read(&mut app, 1, ClipboardAttach::Image("/tmp/p.png".into()));
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(!app.is_composing(), "the late result reopens nothing");
+        assert_eq!(
+            compose::take_stale_paste_images(&mut app),
+            vec![PathBuf::from("/tmp/p.png")]
+        );
+    }
+
+    /// A result the box SETTLES queues nothing: an `Image` whose placeholder goes
+    /// in, copied `Files`, and an `Unmentionable` the box refuses by name.
+    #[test]
+    fn a_settled_result_queues_nothing() {
+        use crate::watch::ClipboardAttach as C;
+        for (result, want) in [
+            (C::Image("/tmp/p.png".into()), "[Image #1] "),
+            (C::Files(vec!["/tmp/a.pdf".into()]), "[a.pdf #1] "),
+            (C::Unmentionable("/tmp/a#b.png".into()), ""),
+        ] {
+            let (mut app, dir) = completion_app(&[]);
+            let token = ctrl_v_token(&mut app);
+            clipboard_read(&mut app, token, result.clone());
+            assert_eq!(draft_text(&app), want, "{result:?} must settle the box");
+            assert!(
+                compose::take_stale_paste_images(&mut app).is_empty(),
+                "{result:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A DROPPED result that is not an `Image` queues nothing: `Files` are the
+    /// user's own, and `Unmentionable` and `Nothing` wrote no file.
+    #[test]
+    fn a_dropped_result_that_is_not_an_image_queues_nothing() {
+        use crate::watch::ClipboardAttach as C;
+        for result in [
+            C::Files(vec!["/tmp/a.pdf".into()]),
+            C::Unmentionable("/tmp/a#b.png".into()),
+            C::Nothing,
+        ] {
+            let (mut app, dir) = completion_app(&[]);
+            type_into_draft(&mut app, "keep");
+            let token = ctrl_v_token(&mut app);
+            press(&mut app, KeyCode::Esc);
+            clipboard_read(&mut app, token, result.clone());
+            assert_eq!(draft_text(&app), "keep", "{result:?} is dropped");
+            assert!(
+                compose::take_stale_paste_images(&mut app).is_empty(),
+                "{result:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The drain hands each queued path over ONCE, in arrival order, then nothing.
+    #[test]
+    fn the_stale_image_drain_returns_each_path_once() {
+        use crate::watch::ClipboardAttach;
+        let mut app = app_with("s1", None);
+        clipboard_read(&mut app, 1, ClipboardAttach::Image("/tmp/a.png".into()));
+        clipboard_read(&mut app, 2, ClipboardAttach::Image("/tmp/b.png".into()));
+        assert_eq!(
+            compose::take_stale_paste_images(&mut app),
+            vec![PathBuf::from("/tmp/a.png"), PathBuf::from("/tmp/b.png")]
+        );
+        assert!(
+            compose::take_stale_paste_images(&mut app).is_empty(),
+            "a drained path is never handed over twice"
+        );
+    }
+
+    // --- the draft shows an attachment placeholder, the send carries the mention
+
+    /// A `Ctrl-N` draft box on a launch dir of its own, named by `tag`.
+    fn draft_box(tag: &str) -> (App, PathBuf) {
+        let dir = unique_temp_dir(tag);
+        let mut app = App::new(Vec::new(), Scope::All, dir.clone());
+        compose::open_background(&mut app, None);
+        (app, dir)
+    }
+
+    /// The argv of a fork, or `None` for an argv that forks nothing.
+    fn forking(argv: Vec<String>) -> Option<Vec<String>> {
+        argv.iter().any(|a| a == "--fork-session").then_some(argv)
+    }
+
+    /// Every send a compose box makes expands the attachment placeholder its draft
+    /// shows into the attachment's mention, inside the LAST argv element: the
+    /// reply's `Enter`, the fork box's `Enter`, the draft's background launch, and
+    /// the draft's and the fork box's `Ctrl-O` runs. Collected, so a send that skips
+    /// the expansion names every row it breaks.
+    #[test]
+    fn each_send_expands_its_attachment_placeholder_inside_the_last_argv_element() {
+        use crate::watch::ClipboardAttach;
+        type Open = fn() -> (App, PathBuf);
+        type Submit = fn(&mut App) -> Option<Vec<String>>;
+        let rows: [(&str, Open, Submit); 5] = [
+            (
+                "the reply's Enter",
+                || completion_app(&[]),
+                |app| match press(app, KeyCode::Enter) {
+                    Outcome::Send(req) => Some(req.argv),
+                    _ => None,
+                },
+            ),
+            ("the fork box's Enter", fork_box_app, |app| {
+                match press(app, KeyCode::Enter) {
+                    Outcome::Send(req) => forking(req.argv),
+                    _ => None,
+                }
+            }),
+            (
+                "the draft's Enter",
+                || draft_box("expand-draft-enter"),
+                |app| match press(app, KeyCode::Enter) {
+                    Outcome::BgLaunch(req) => Some(req.argv),
+                    _ => None,
+                },
+            ),
+            (
+                "the draft's Ctrl-O",
+                || draft_box("expand-draft-ctrl-o"),
+                |app| match press_ctrl(app, KeyCode::Char('o')) {
+                    Outcome::Resume(ready) => Some(ready.argv),
+                    _ => None,
+                },
+            ),
+            (
+                "the fork box's Ctrl-O",
+                fork_box_app,
+                |app| match press_ctrl(app, KeyCode::Char('o')) {
+                    Outcome::Resume(ready) => forking(ready.argv),
+                    _ => None,
+                },
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, open, send) in rows {
+            let (mut app, dir) = open();
+            type_into_draft(&mut app, "look");
+            let token = ctrl_v_token(&mut app);
+            clipboard_read(
+                &mut app,
+                token,
+                ClipboardAttach::Image("/tmp/red square.png".into()),
+            );
+            assert_eq!(
+                draft_text(&app),
+                "look [Image #1] ",
+                "{name}: the draft shows the placeholder, no mention"
+            );
+            // Exact, so it pins both halves: the mention is there, and no
+            // `[Image #` text is left.
+            match send(&mut app) {
+                Some(argv) => {
+                    let last = argv.last().map(String::as_str);
+                    if last != Some("look @\"/tmp/red square.png\" ") {
+                        wrong.push(format!("{name}: sent {last:?}"));
+                    }
+                }
+                None => wrong.push(format!("{name}: no such send ({:?})", app.status)),
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A session whose last turn recorded an effort carries it (`--effort xhigh`,
+    /// `send::build_send_argv` / `build_fork_send_argv` /
+    /// `resume::build_fork_run_argv`) on the three routes that carry one: the
+    /// reply's `Enter` and the fork box's `Enter` and `Ctrl-O`. Expanding an
+    /// attachment placeholder changes none of that: the message is still the ONE
+    /// trailing element, with the flag pair right in front of it where `main`
+    /// places it, and no placeholder text survives anywhere in the argv. (The
+    /// draft's two sends carry no effort: a new session has none.)
+    #[test]
+    fn a_carried_effort_stays_in_front_of_the_one_expanded_message_on_every_route() {
+        use crate::watch::ClipboardAttach;
+        type Open = fn(&mut App);
+        type Submit = fn(&mut App) -> Option<Vec<String>>;
+        let routes: [(&str, Open, Submit); 3] = [
+            (
+                "the reply's Enter",
+                |app| {
+                    press_ctrl(app, KeyCode::Char('r'));
+                },
+                |app| match press(app, KeyCode::Enter) {
+                    Outcome::Send(req) => Some(req.argv),
+                    _ => None,
+                },
+            ),
+            (
+                "the fork box's Enter",
+                |app| {
+                    press_fork(app);
+                },
+                |app| match press(app, KeyCode::Enter) {
+                    Outcome::Send(req) => forking(req.argv),
+                    _ => None,
+                },
+            ),
+            (
+                "the fork box's Ctrl-O",
+                |app| {
+                    press_fork(app);
+                },
+                |app| match press_ctrl(app, KeyCode::Char('o')) {
+                    Outcome::Resume(ready) => forking(ready.argv),
+                    _ => None,
+                },
+            ),
+        ];
+        let message = "look @\"/tmp/red square.png\" ";
+        let mut wrong = Vec::new();
+        for (name, open, send) in routes {
+            let (session, dir) = resumable_session_for_send("carry-effort-attach");
+            let mut text = std::fs::read_to_string(&session.file).expect("read the fixture");
+            text.push_str(&format!(
+                "\n{{\"type\":\"assistant\",\"sessionId\":\"sess-send-e2e\",\"cwd\":\"{}\",\"message\":{{\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":\"ok\"}},\"effort\":\"xhigh\",\"perTurnEffort\":\"xhigh\"}}\n",
+                dir.display()
+            ));
+            std::fs::write(&session.file, text).expect("append the answering turn");
+            let mut app = App::new(vec![session], Scope::All, dir.clone());
+            seed_live(&mut app, &[]);
+            let _ = app.preview_text(80);
+            open(&mut app);
+            assert!(app.is_composing(), "{name}: the box must really open");
+            assert_eq!(
+                app.compose_default().and_then(|d| d.carried_effort()),
+                Some("xhigh"),
+                "{name}: the fixture must carry its effort, or this proves nothing"
+            );
+            type_into_draft(&mut app, "look");
+            let token = ctrl_v_token(&mut app);
+            clipboard_read(
+                &mut app,
+                token,
+                ClipboardAttach::Image("/tmp/red square.png".into()),
+            );
+            assert_eq!(draft_text(&app), "look [Image #1] ", "{name}");
+            match send(&mut app) {
+                Some(argv) => {
+                    let n = argv.len();
+                    let efforts = argv.iter().filter(|a| *a == "--effort").count();
+                    if argv.last().map(String::as_str) != Some(message)
+                        || argv[n - 3..n - 1] != ["--effort", "xhigh"]
+                        || efforts != 1
+                        || argv.iter().any(|a| a.contains("[Image #"))
+                    {
+                        wrong.push(format!("{name}: {argv:?}"));
+                    }
+                }
+                None => wrong.push(format!("{name}: no such send ({:?})", app.status)),
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A word typed right against a placeholder still reaches claude as a mention:
+    /// the expansion leads it with one space, claude's extractor boundary.
+    #[test]
+    fn a_placeholder_glued_to_a_word_is_sent_with_a_space_before_its_mention() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        let token = ctrl_v_token(&mut app);
+        clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Image("/tmp/red square.png".into()),
+        );
+        assert_eq!(draft_text(&app), "[Image #1] ");
+        // Back to the start with a key the reply box forwards to its editor (its
+        // `Home` is the preview's jump), then a word right against the placeholder.
+        for _ in 0.."[Image #1] ".chars().count() {
+            press(&mut app, KeyCode::Left);
+        }
+        type_into_draft(&mut app, "look");
+        assert_eq!(draft_text(&app), "look[Image #1] ");
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter with the list closed must send: {:?}", app.status);
+        };
+        assert_eq!(
+            req.argv.last().map(String::as_str),
+            Some("look @\"/tmp/red square.png\" ")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pick list reads the token the caret ends, never a placeholder: a `/` or
+    /// `@` typed at every caret position from right before an attachment
+    /// placeholder to right after it opens NO list, even with a catalog whose
+    /// command, agent and file names word-start-match the placeholder's own text
+    /// (`Image`, `image notes.pdf`); only after the placeholder's trailing space is a
+    /// trigger an ordinary token, and a pick there leaves the placeholder, and its
+    /// mention at send, intact.
+    #[test]
+    fn a_trigger_beside_a_placeholder_opens_no_list_and_a_pick_after_it_leaves_it_intact() {
+        use crate::watch::ClipboardAttach;
+        let cases = [
+            (
+                "[Image #1]",
+                ClipboardAttach::Image("/tmp/p.png".into()),
+                "@\"/tmp/p.png\"",
+            ),
+            (
+                "[image notes.pdf #1]",
+                ClipboardAttach::Files(vec!["/tmp/image notes.pdf".into()]),
+                "@\"/tmp/image notes.pdf\"",
+            ),
+            (
+                "[a  b.pdf #1]",
+                ClipboardAttach::Files(vec!["/tmp/a  b.pdf".into()]),
+                "@\"/tmp/a  b.pdf\"",
+            ),
+        ];
+        for (placeholder, result, mention) in cases {
+            let (mut app, dir) = completion_app(&[]);
+            deliver_catalog(
+                &mut app,
+                &dir,
+                Some(catalog(
+                    &[("image-tool", "Runs it"), ("Image-notes", "Notes")],
+                    &[("Image-Agent", "Looks at images")],
+                )),
+            );
+            let token = ctrl_v_token(&mut app);
+            clipboard_read(&mut app, token, result);
+            let shown = format!("{placeholder} ");
+            assert_eq!(draft_text(&app), shown);
+            let len = placeholder.chars().count();
+            for _ in 0..=len {
+                press(&mut app, KeyCode::Left);
+            }
+            for at in 0..=len {
+                for trigger in ['@', '/'] {
+                    type_into_draft(&mut app, &trigger.to_string());
+                    assert!(
+                        !list_open(&app),
+                        "{placeholder:?}: {trigger:?} typed at column {at} opened a list"
+                    );
+                    press(&mut app, KeyCode::Backspace);
+                    assert_eq!(draft_text(&app), shown, "{placeholder:?} at {at}");
+                }
+                press(&mut app, KeyCode::Right);
+            }
+            // Past the trailing space the same `@` is an ordinary token: its list
+            // is the agent ahead of the file of the same tier, and picking the
+            // agent leaves the placeholder alone.
+            std::fs::write(dir.join("image.png"), "i").expect("write image.png");
+            type_into_draft(&mut app, "@ima");
+            assert_eq!(
+                list_rows(&app),
+                rows(&[
+                    ("Image-Agent (agent)", Some("Looks at images")),
+                    ("image.png", None),
+                ]),
+                "{placeholder:?}: the agent heads the list the typed letters ask for"
+            );
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(draft_text(&app), format!("{shown}@agent-Image-Agent "));
+            let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+                panic!("{placeholder:?}: Enter with the list closed must send");
+            };
+            assert_eq!(
+                req.argv.last().map(String::as_str),
+                Some(format!("{mention} @agent-Image-Agent ").as_str()),
+                "{placeholder:?}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A token whose own characters are part typed and part the placeholder's
+    /// never opens a list either: an `@` typed after `my ` inside `[my report.pdf
+    /// #1]` and then walked right over `report.pdf` reads as the token
+    /// `@report.pdf`, which, with its `@` taken out, is no longer a placeholder to
+    /// stand around it. The list it would open offers `report.pdf`, and the pick
+    /// writes over the placeholder's own text.
+    #[test]
+    fn a_token_made_of_typed_and_placeholder_characters_opens_no_list() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        // A name that holds the query without being it, so a pick changes the text.
+        std::fs::write(dir.join("report.pdf.bak"), "r").expect("write report.pdf.bak");
+        let token = ctrl_v_token(&mut app);
+        clipboard_read(
+            &mut app,
+            token,
+            ClipboardAttach::Files(vec!["/tmp/my report.pdf".into()]),
+        );
+        let placeholder = "[my report.pdf #1]";
+        assert_eq!(draft_text(&app), format!("{placeholder} "));
+        for _ in 0..=placeholder.chars().count() {
+            press(&mut app, KeyCode::Left);
+        }
+        for _ in 0.."[my ".chars().count() {
+            press(&mut app, KeyCode::Right);
+        }
+        type_into_draft(&mut app, "@");
+        assert!(!list_open(&app), "an `@` typed inside opened a list");
+        for _ in 0.."report.pdf".chars().count() {
+            press(&mut app, KeyCode::Right);
+        }
+        let shown = draft_text(&app);
+        assert_eq!(
+            shown, "[my @report.pdf #1] ",
+            "the caret is at the end of the name"
+        );
+        // The accept key of an open list is `Tab` (or `Enter`); with the list shut
+        // `Tab` would be the editor's, so it is pressed only when a list is open.
+        let opened = list_open(&app);
+        if opened {
+            press(&mut app, KeyCode::Tab);
+        }
+        assert_eq!(
+            draft_text(&app),
+            shown,
+            "accepting a pick rewrote the placeholder"
+        );
+        assert!(
+            !opened,
+            "a token holding the placeholder's own `report.pdf` opened a list"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same guard through more keys than the first one: a character typed on
+    /// the end of the name, and a trigger typed in front of the placeholder and
+    /// walked into it (`@` and `/` alike).
+    /// Each leaves a token that overlaps the placeholder, so no list opens and the
+    /// accept key changes nothing. Collected, so a broken rule names every row it
+    /// breaks.
+    #[test]
+    fn a_token_overlapping_a_placeholder_opens_no_list_on_every_key_path() {
+        use crate::watch::ClipboardAttach;
+        enum Op {
+            Left(usize),
+            Right(usize),
+            Type(&'static str),
+        }
+        // Each row starts with the caret after the placeholder and its space.
+        let rows: [(&str, &str, Vec<Op>); 3] = [
+            (
+                "a character typed on the end of the name",
+                "/tmp/my report.pdf",
+                vec![
+                    Op::Left(19),
+                    Op::Right(4),
+                    Op::Type("@"),
+                    Op::Right(10),
+                    Op::Type("X"),
+                ],
+            ),
+            (
+                "an `@` typed in front, walked into the placeholder",
+                "/tmp/my report.pdf",
+                vec![Op::Left(19), Op::Type("@x"), Op::Right(3)],
+            ),
+            (
+                "a `/` typed in front, walked into the placeholder",
+                "/tmp/my report.pdf",
+                vec![Op::Left(19), Op::Type("/x"), Op::Right(3)],
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, path, ops) in rows {
+            let (mut app, dir) = completion_app(&[]);
+            deliver_catalog(
+                &mut app,
+                &dir,
+                Some(catalog(&[("x[my-cmd", "Runs it")], &[])),
+            );
+            // Names that hold each token's query without being it, so a pick
+            // changes the text.
+            for file in ["report.pdf.bak", "report.pdfX.bak", "x.pdf.bak", "x[my.txt"] {
+                std::fs::write(dir.join(file), "f").expect("write a file");
+            }
+            let token = ctrl_v_token(&mut app);
+            clipboard_read(&mut app, token, ClipboardAttach::Files(vec![path.into()]));
+            assert!(draft_text(&app).ends_with(" #1] "), "{name}: no attach");
+            for op in ops {
+                match op {
+                    Op::Left(n) => (0..n).for_each(|_| _ = press(&mut app, KeyCode::Left)),
+                    Op::Right(n) => (0..n).for_each(|_| _ = press(&mut app, KeyCode::Right)),
+                    Op::Type(text) => type_into_draft(&mut app, text),
+                }
+            }
+            let shown = draft_text(&app);
+            let opened = list_open(&app);
+            if opened {
+                press(&mut app, KeyCode::Tab);
+            }
+            if opened || draft_text(&app) != shown {
+                wrong.push(format!(
+                    "{name}: {shown:?} opened a list: {opened}, a pick left {:?}",
+                    draft_text(&app)
+                ));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Attach `/tmp/my report.pdf` to the open compose through the real attach path,
+    /// then type `@rep` after its trailing space so a pick list opens over a folder
+    /// holding `report.pdf.bak`. Returns the placeholder it recorded.
+    fn attach_then_open_a_list(app: &mut App, dir: &Path) -> &'static str {
+        use crate::watch::ClipboardAttach;
+        std::fs::write(dir.join("report.pdf.bak"), "r").expect("write report.pdf.bak");
+        let token = ctrl_v_token(app);
+        clipboard_read(
+            app,
+            token,
+            ClipboardAttach::Files(vec!["/tmp/my report.pdf".into()]),
+        );
+        let placeholder = "[my report.pdf #1]";
+        assert_eq!(draft_text(app), format!("{placeholder} "));
+        type_into_draft(app, "@rep");
+        assert!(
+            list_open(app),
+            "a list over the file must be open, or this proves nothing"
+        );
+        placeholder
+    }
+
+    /// The traced repro of the review: in a `Ctrl-N` draft, `Home` reaches the editor
+    /// and moves the caret away from the token an open list was computed for. The
+    /// list must close with it, since a pick there deleted three characters of the
+    /// placeholder (`[my`) and wrote at column 0.
+    #[test]
+    fn home_in_a_draft_closes_the_list_so_a_pick_never_writes_into_a_placeholder() {
+        let (mut app, dir) = draft_box("home-stale-list");
+        let placeholder = attach_then_open_a_list(&mut app, &dir);
+        press(&mut app, KeyCode::Home);
+        assert_eq!(
+            app.compose.as_ref().unwrap().textarea.cursor(),
+            (0, 0),
+            "the draft's Home reaches the editor"
+        );
+        let opened = list_open(&app);
+        let shown = draft_text(&app);
+        if opened {
+            press(&mut app, KeyCode::Tab);
+        }
+        assert!(
+            draft_text(&app).starts_with(placeholder),
+            "a pick rewrote the placeholder: {:?} -> {:?}",
+            shown,
+            draft_text(&app)
+        );
+        assert!(!opened, "the list outlived the caret that opened it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every key that is the editor's in a draft yet claimed by the preview in a
+    /// reply or fork box (`Home`, `End`, `PgUp`, `PgDn`, `Ctrl-T`, `Ctrl-E`,
+    /// `Ctrl-U`, `Ctrl-D`), and `Ctrl-Home`, pressed with a list open in each box:
+    /// whatever the key did to the caret or the text, accepting what is then on
+    /// offer leaves a placeholder that stood whole before the accept whole.
+    /// Collected, so a broken path names every row it breaks.
+    #[test]
+    fn no_key_leaves_an_open_list_whose_pick_writes_into_a_placeholder() {
+        type Open = fn() -> (App, PathBuf);
+        let boxes: [(&str, Open); 3] = [
+            ("draft", || draft_box("stale-list-draft")),
+            ("reply", || completion_app(&[])),
+            ("fork", fork_box_app),
+        ];
+        let keys: [(&str, KeyCode, bool); 9] = [
+            ("Home", KeyCode::Home, false),
+            ("End", KeyCode::End, false),
+            ("PgUp", KeyCode::PageUp, false),
+            ("PgDn", KeyCode::PageDown, false),
+            ("Ctrl-T", KeyCode::Char('t'), true),
+            ("Ctrl-E", KeyCode::Char('e'), true),
+            ("Ctrl-U", KeyCode::Char('u'), true),
+            ("Ctrl-D", KeyCode::Char('d'), true),
+            ("Ctrl-Home", KeyCode::Home, true),
+        ];
+        let mut wrong = Vec::new();
+        for (box_name, open) in boxes {
+            for (key_name, code, ctrl_held) in keys {
+                let (mut app, dir) = open();
+                let placeholder = attach_then_open_a_list(&mut app, &dir);
+                if ctrl_held {
+                    press_ctrl(&mut app, code);
+                } else {
+                    press(&mut app, code);
+                }
+                let shown = draft_text(&app);
+                let whole = shown.contains(placeholder);
+                if list_open(&app) {
+                    press(&mut app, KeyCode::Tab);
+                }
+                let after = draft_text(&app);
+                if whole && !after.contains(placeholder) {
+                    wrong.push(format!("{box_name} {key_name}: {shown:?} -> {after:?}"));
+                }
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A `/` pick that ranked by a word-start hit (`it` for `image-tool`) and an
+    /// attach that lands after it do not touch each other: the command stays as
+    /// picked, the placeholder as inserted, and the send carries both.
+    #[test]
+    fn a_slash_pick_and_a_later_attach_leave_each_other_intact() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        deliver_catalog(
+            &mut app,
+            &dir,
+            Some(catalog(&[("image-tool", "Runs a tool")], &[])),
+        );
+        type_into_draft(&mut app, "/it");
+        assert_eq!(
+            list_rows(&app),
+            rows(&[("/image-tool", Some("Runs a tool"))]),
+            "a word-start hit, or this proves nothing"
+        );
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(draft_text(&app), "/image-tool ");
+        let token = ctrl_v_token(&mut app);
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        assert_eq!(draft_text(&app), "/image-tool [Image #1] ");
+        assert!(!list_open(&app));
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter with the list closed must send: {:?}", app.status);
+        };
+        assert_eq!(
+            req.argv.last().map(String::as_str),
+            Some("/image-tool @\"/tmp/p.png\" ")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The size limit (`c3780bf`) is asked of the message that is SENT, each
+    /// placeholder expanded into its mention, never of the shorter draft the editor
+    /// shows: a one-line placeholder over a long folder is a tiny draft and an
+    /// over-long argument. Every launch path that checks the limit refuses it, the
+    /// box and its placeholder kept, and a short folder still sends.
+    #[test]
+    fn the_size_limit_counts_the_expanded_mention_not_the_placeholder() {
+        use crate::watch::ClipboardAttach;
+        type Open = fn() -> (App, PathBuf);
+        type Go = fn(&mut App) -> Outcome;
+        let rows: [(&str, Open, Go); 4] = [
+            (
+                "the reply's Enter",
+                || completion_app(&[]),
+                |app| press(app, KeyCode::Enter),
+            ),
+            (
+                "the draft's Enter",
+                || draft_box("limit-draft-enter"),
+                |app| press(app, KeyCode::Enter),
+            ),
+            (
+                "the draft's Ctrl-O",
+                || draft_box("limit-draft-ctrl-o"),
+                |app| press_ctrl(app, KeyCode::Char('o')),
+            ),
+            ("the fork box's Ctrl-O", fork_box_app, |app| {
+                press_ctrl(app, KeyCode::Char('o'))
+            }),
+        ];
+        let long_dir = "d".repeat(send::COMPOSE_PROMPT_MAX_BYTES);
+        let mut wrong = Vec::new();
+        for (name, open, go) in rows {
+            let (mut app, dir) = open();
+            let token = ctrl_v_token(&mut app);
+            clipboard_read(
+                &mut app,
+                token,
+                ClipboardAttach::Files(vec![PathBuf::from(format!("/tmp/{long_dir}/a.pdf"))]),
+            );
+            let shown = draft_text(&app);
+            if shown != "[a.pdf #1] " {
+                wrong.push(format!("{name}: the draft shows {shown:?}"));
+            }
+            let out = go(&mut app);
+            let refused = matches!(out, Outcome::Continue)
+                && app
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains(&send::COMPOSE_PROMPT_MAX_BYTES.to_string()))
+                && app.is_composing()
+                && draft_text(&app) == shown;
+            if !refused {
+                wrong.push(format!("{name}: not refused ({:?})", app.status));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A box still taking an attachment is told to WAIT, in every box and on both
+    /// keys, even when its draft is already past the size limit: the wait comes
+    /// before the size check, so a draft that is about to change is not refused for
+    /// a size it is not final at. Once the read lands, the refusal answers.
+    #[test]
+    fn a_pending_attach_is_waited_for_before_an_over_long_draft_is_refused() {
+        type Open = fn() -> (App, PathBuf);
+        type Go = fn(&mut App) -> Outcome;
+        let rows: [(&str, Open, Go, &str); 3] = [
+            (
+                "the draft's Enter",
+                || draft_box("wait-limit-enter"),
+                |app| press(app, KeyCode::Enter),
+                compose::ENTER_WHILE_ATTACHING_HINT,
+            ),
+            (
+                "the draft's Ctrl-O",
+                || draft_box("wait-limit-ctrl-o"),
+                |app| press_ctrl(app, KeyCode::Char('o')),
+                compose::CTRL_O_WHILE_ATTACHING_HINT,
+            ),
+            (
+                "the fork box's Ctrl-O",
+                fork_box_app,
+                |app| press_ctrl(app, KeyCode::Char('o')),
+                compose::CTRL_O_WHILE_ATTACHING_HINT,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, open, go, nudge) in rows {
+            let (mut app, dir) = open();
+            paste(&mut app, &"x".repeat(send::COMPOSE_PROMPT_MAX_BYTES));
+            type_into_draft(&mut app, "y");
+            let _ = ctrl_v_token(&mut app);
+            let out = go(&mut app);
+            if !matches!(out, Outcome::Continue) || app.status.as_deref() != Some(nudge) {
+                wrong.push(format!("{name}: {:?}", app.status));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Placeholder numbers run across the board session, so one pasted out of an
+    /// earlier box matches nothing in a later one and is sent as the text it is:
+    /// never the earlier box's file, and never this box's file under its number.
+    #[test]
+    fn a_placeholder_pasted_from_another_box_stays_text() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        let token = ctrl_v_token(&mut app);
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/a.png".into()));
+        assert_eq!(draft_text(&app), "[Image #1] ", "box A");
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            !app.is_composing(),
+            "box A must close, or this proves nothing"
+        );
+
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        let token = ctrl_v_token(&mut app);
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/b.png".into()));
+        assert_eq!(
+            draft_text(&app),
+            "[Image #2] ",
+            "box B: numbering is board-wide"
+        );
+
+        // Observed: neither pasted text is shaped like a copied file's rendering,
+        // so neither asks the clipboard (`#2]` and `#1]` have no extension, and `[`
+        // opens no path).
+        assert!(!compose::paste_may_name_files("[report.pdf #2]"));
+        assert!(!compose::paste_may_name_files("[Image #1]"));
+        paste(&mut app, "[Image #1] ");
+        paste(&mut app, "[report.pdf #2]");
+        assert_eq!(draft_text(&app), "[Image #2] [Image #1] [report.pdf #2]");
+        assert_eq!(
+            pending_purpose(&app),
+            None,
+            "no copied-file check is pending"
+        );
+
+        let Outcome::Send(req) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter with the list closed must send: {:?}", app.status);
+        };
+        assert_eq!(
+            req.argv.last().map(String::as_str),
+            Some("@\"/tmp/b.png\" [Image #1] [report.pdf #2]")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A result the box DROPS — the late `Image` of a read `Esc` cancelled, or a
+    /// stale token's reaching a newer box — records no attachment and takes no
+    /// number.
+    #[test]
+    fn a_dropped_result_records_no_attachment() {
+        use crate::watch::ClipboardAttach;
+        let (mut app, dir) = completion_app(&[]);
+        let before = app.attachment_number;
+        let token = ctrl_v_token(&mut app);
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.is_composing() && pending_purpose(&app).is_none(),
+            "Esc must cancel only the read, or this proves nothing"
+        );
+        clipboard_read(&mut app, token, ClipboardAttach::Image("/tmp/p.png".into()));
+        assert!(
+            app.compose.as_ref().unwrap().attachments.is_empty(),
+            "the cancelled read"
+        );
+        assert_eq!(app.attachment_number, before, "the cancelled read");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (mut app, dir) = completion_app(&[]);
+        let before = app.attachment_number;
+        let old = ctrl_v_token(&mut app);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.is_composing(), "the box must be closed");
+        press_ctrl(&mut app, KeyCode::Char('r'));
+        ctrl_v_token(&mut app);
+        clipboard_read(&mut app, old, ClipboardAttach::Image("/tmp/old.png".into()));
+        assert!(
+            app.compose.as_ref().unwrap().attachments.is_empty(),
+            "the stale token"
+        );
+        assert_eq!(app.attachment_number, before, "the stale token");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

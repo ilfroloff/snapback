@@ -90,6 +90,186 @@ pub const COMPLETION_VISIBLE_ROWS: usize = 8;
 /// handshake".
 pub const AGENT_MENTION_PREFIX: &str = "agent-";
 
+/// Why [`file_mention`] would not write a path: each cause names what claude's
+/// mention extractor cannot carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MentionRefusal {
+    /// Not absolute: claude resolves a relative mention against ITS cwd.
+    Relative,
+    /// Not valid UTF-8, so it cannot sit in the argv text.
+    NotUtf8,
+    /// Contains `"`, which ends the quoted form.
+    Quote,
+    /// Contains `#`, which truncates the path (the `#L<n>` suffix parse).
+    Hash,
+    /// Contains an `@` right after an [`is_mention_boundary`] character, which
+    /// claude's unquoted extractor would read as a SECOND mention inside this one.
+    /// Still NEEDED in claude 2.1.306 (read from the installed binary, 2026-10-23):
+    /// its unquoted scanner `wTn`, called from `XDr` as `wTn(e,!1)`, splits the
+    /// text on whitespace with no quote awareness, takes an `@` that starts a token
+    /// or, later in one, follows `。、？！`, and `XDr` drops only results starting
+    /// with `"`. So an `@` after whitespace INSIDE the quoted path still yields a
+    /// second mention: those functions, run on `@"/tmp/a @b/c.png"`, give `b/c.png`
+    /// (claude itself was not run). For `。、？！` the refusal is broader than 2.1.306
+    /// needs: they split a second mention off only after earlier whitespace in the
+    /// path. 2.1.289 read this as a regex (`mnn`).
+    HiddenMention,
+    /// Contains a control character (a newline breaks extraction).
+    Control,
+    /// Ends in ` (agent)`, which claude drops from a quoted mention.
+    AgentSuffix,
+}
+
+impl MentionRefusal {
+    /// The cause in words, for a status-line refusal.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Relative => "its path is not absolute",
+            Self::NotUtf8 => "its path is not valid UTF-8",
+            Self::Quote => "its path contains a double quote",
+            Self::Hash => "its path contains a #",
+            Self::HiddenMention => "its path contains an @ after whitespace or 。、？！",
+            Self::Control => "its path contains a control character",
+            Self::AgentSuffix => "its path ends in \" (agent)\"",
+        }
+    }
+}
+
+/// Whether `c` may stand right before the `@` of a mention claude's extractors
+/// read: the prefix class `[\s。、？！]`, where `\s` is JavaScript's. An absent
+/// previous character (the text's start) is the `^` arm and is the caller's to
+/// decide, since this takes a `char`.
+///
+/// JavaScript's `\s` is U+0009 to U+000D, U+0020, U+00A0, U+1680, U+2000 to
+/// U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 and U+FEFF. It is spelled out
+/// rather than derived from `char::is_whitespace`, which ALSO takes U+0085 (NEL)
+/// and leaves out U+FEFF, and whose set may move with a std Unicode update. A NEL
+/// before an `@` is therefore NOT a boundary: claude reads `\u{85}@"…"` as plain
+/// text, so a mention written there must be led by a space.
+///
+/// Read from the claude binaries: `mnn` in 2.1.289 (2026-10-06) and `XDr` in
+/// 2.1.306 (2026-10-22) carry the same quoted rule, `(^|[\s。、？！])@"([^"]+)"`,
+/// over this boundary class (`lX` in 2.1.306). snapback writes only the QUOTED
+/// form, so that rule is the one it depends on. Used
+/// for every decision about what stands before an `@`: [`file_mention`]'s refusal
+/// of a hidden second mention, [`mention_insert_text`]'s leading space and
+/// `compose::expand_attachments`'s. A check about the text AFTER a caret, or about
+/// where a pick-list token ends ([`completion_context`]), is a different question
+/// and keeps its own rule.
+pub(crate) fn is_mention_boundary(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}'..='\u{d}'
+            | ' '
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+            | '。'
+            | '、'
+            | '？'
+            | '！'
+    )
+}
+
+/// An `@"<absolute path>"` file mention, the form claude attaches in `-p`
+/// without a permission prompt (a BARE path outside the cwd gets its Read
+/// denied). claude 2.1.289 reads the quoted form with
+/// `(^|[\s。、？！])@"([^"]+)"`, drops a quoted name ending in ` (agent)`, and
+/// parses the name with `^([^#]+)(?:#L(\d+)(?:-(\d+))?)?(?:#[^#]*)?$`, so a `#`
+/// truncates the path (read from the binary and measured in `claude -p`,
+/// 2026-10-06). Evidence: `docs/agents/CLAUDE_CLI.md`.
+///
+/// It ALSO runs the unquoted extractor over the same text (a regex,
+/// `(^|[\s。、？！])@([^\s]+)\b`, in claude 2.1.289, 2026-10-06; a hand-written,
+/// quote-blind scanner in 2.1.306, read 2026-10-23), so an `@` right after an
+/// [`is_mention_boundary`] character INSIDE the quoted path can add a second
+/// mention: such a path is refused, whatever follows its `@`. 2.1.289's regex
+/// takes every boundary character; 2.1.306 takes whitespace, but `。、？！` only
+/// after an earlier whitespace in the path, so there the refusal is broader than
+/// needed (see [`MentionRefusal::HiddenMention`]). An `@` glued to
+/// a word (`/tmp/a@b.png`) is not a mention and stays, and the `^` arm never
+/// applies, since the path is absolute.
+pub fn file_mention(path: &Path) -> Result<String, MentionRefusal> {
+    if !path.is_absolute() {
+        return Err(MentionRefusal::Relative);
+    }
+    let s = path.to_str().ok_or(MentionRefusal::NotUtf8)?;
+    if s.contains('"') {
+        return Err(MentionRefusal::Quote);
+    }
+    if s.contains('#') {
+        return Err(MentionRefusal::Hash);
+    }
+    if s.chars()
+        .zip(s.chars().skip(1))
+        .any(|(before, at)| at == '@' && is_mention_boundary(before))
+    {
+        return Err(MentionRefusal::HiddenMention);
+    }
+    if s.chars().any(char::is_control) {
+        return Err(MentionRefusal::Control);
+    }
+    if s.ends_with(AGENT_LABEL_SUFFIX) {
+        return Err(MentionRefusal::AgentSuffix);
+    }
+    Ok(format!("@\"{s}\""))
+}
+
+/// What an attachment placeholder stands for, so [`attachment_placeholder`] knows
+/// what to show of its path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachmentKind {
+    /// A clipboard image saved in the paste cache (`ClipboardAttach::Image`).
+    Image,
+    /// A copied file, referenced in place (`ClipboardAttach::Files`).
+    File,
+}
+
+/// What an image's attachment placeholder says in place of the cache file's
+/// name, which means nothing to the user: `[Image #1]`.
+pub const IMAGE_ATTACHMENT_LABEL: &str = "Image";
+
+/// The attachment placeholder the draft shows: `[Image #<number>]` for an image,
+/// `[<file name> #<number>]` for a copied file, or, for a path with no file name
+/// (`/`), the whole path in the name's place. The ONE place this wording exists.
+///
+/// Draft-only text: `compose::expand_attachments` swaps it for [`file_mention`]'s
+/// `@"…"` when the draft is sent. The name part never holds a `#`, because
+/// [`file_mention`] refuses such a path before it gets a placeholder.
+pub fn attachment_placeholder(kind: AttachmentKind, path: &Path, number: u64) -> String {
+    let label = match kind {
+        AttachmentKind::Image => IMAGE_ATTACHMENT_LABEL.into(),
+        AttachmentKind::File => path
+            .file_name()
+            .map_or_else(|| path.to_string_lossy(), |name| name.to_string_lossy()),
+    };
+    format!("[{label} #{number}]")
+}
+
+/// The text to insert at the caret for `mentions`, the attachment placeholders
+/// `compose::finish_attach` inserts: joined by one space, led by one space unless
+/// the caret is at a line start or after a [`is_mention_boundary`] character, and
+/// ALWAYS ended by one space
+/// so [`completion_context`] never reads what precedes the caret as an open `@`
+/// token. The leading space is claude's: a mention glued to a word is plain text
+/// to it, and `compose::expand_attachments` writes the mention in the
+/// placeholder's place.
+pub fn mention_insert_text(char_before_caret: Option<char>, mentions: &[String]) -> String {
+    let mut out = String::new();
+    if matches!(char_before_caret, Some(c) if !is_mention_boundary(c)) {
+        out.push(' ');
+    }
+    out.push_str(&mentions.join(" "));
+    out.push(' ');
+    out
+}
+
 /// Appended to an agent's label so a row reads as an agent without a section
 /// title: claude 2.1.284's own typeahead labels an agent `<name> (agent)`.
 pub const AGENT_LABEL_SUFFIX: &str = " (agent)";
@@ -2601,5 +2781,152 @@ mod tests {
         assert!(entries
             .iter()
             .all(|c| c.label_marks.is_empty() && c.description_marks.is_empty()));
+    }
+
+    #[test]
+    fn file_mention_quotes_what_claude_can_carry_and_refuses_the_rest() {
+        use std::path::PathBuf;
+        let ok = |p: &str| file_mention(&PathBuf::from(p));
+        assert_eq!(ok("/tmp/a.png").unwrap(), "@\"/tmp/a.png\"");
+        assert_eq!(ok("/tmp/my shot.png").unwrap(), "@\"/tmp/my shot.png\"");
+        assert_eq!(ok("/tmp/снимок.png").unwrap(), "@\"/tmp/снимок.png\"");
+        assert_eq!(ok("/tmp/a#b.png"), Err(MentionRefusal::Hash));
+        assert_eq!(ok("/tmp/a\"b.png"), Err(MentionRefusal::Quote));
+        assert_eq!(ok("/tmp/a\nb.png"), Err(MentionRefusal::Control));
+        assert_eq!(ok("/tmp/x (agent)"), Err(MentionRefusal::AgentSuffix));
+        assert_eq!(ok("rel/a.png"), Err(MentionRefusal::Relative));
+        // An `@` after a boundary character. In 2.1.306 one after whitespace inside
+        // the quoted path yields a second mention (the space, tab, U+FEFF and
+        // U+3000 rows); the `。、？！` rows have no whitespace before them and are
+        // refused because 2.1.289's regex split there, broader than 2.1.306
+        // needs (`MentionRefusal::HiddenMention`, CLAUDE_CLI.md).
+        for hidden in [
+            "/tmp/a @b.png",
+            "/tmp/a\t@b",
+            "/tmp/x。@y",
+            "/tmp/x、@y",
+            "/tmp/x？@y",
+            "/tmp/x！@y",
+            "/tmp/x\u{feff}@y",
+            "/tmp/x\u{3000}@y",
+        ] {
+            assert_eq!(ok(hidden), Err(MentionRefusal::HiddenMention), "{hidden:?}");
+        }
+        // A NEL is whitespace to Rust but not to JavaScript's `\s`, so claude reads
+        // no second mention after it.
+        assert_eq!(ok("/tmp/x\u{85}@y").unwrap_err(), MentionRefusal::Control);
+        // An `@` glued to a word, or after an ASCII lookalike, is not a mention.
+        assert_eq!(ok("/tmp/a@b.png").unwrap(), "@\"/tmp/a@b.png\"");
+        assert_eq!(ok("/tmp/x?@y").unwrap(), "@\"/tmp/x?@y\"");
+    }
+
+    /// An absolute path whose bytes are not UTF-8 cannot sit in the argv text.
+    #[cfg(unix)]
+    #[test]
+    fn file_mention_refuses_a_path_that_is_not_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::Path::new(OsStr::from_bytes(b"/tmp/\xff.png"));
+        assert!(path.is_absolute(), "fixture: only the encoding is wrong");
+        assert_eq!(file_mention(path), Err(MentionRefusal::NotUtf8));
+    }
+
+    /// Every refusal's wording, the cause a status line names after the path.
+    #[test]
+    fn every_mention_refusal_describes_its_own_cause() {
+        let rows = [
+            (MentionRefusal::Relative, "its path is not absolute"),
+            (MentionRefusal::NotUtf8, "its path is not valid UTF-8"),
+            (MentionRefusal::Quote, "its path contains a double quote"),
+            (MentionRefusal::Hash, "its path contains a #"),
+            (
+                MentionRefusal::HiddenMention,
+                "its path contains an @ after whitespace or 。、？！",
+            ),
+            (
+                MentionRefusal::Control,
+                "its path contains a control character",
+            ),
+            (MentionRefusal::AgentSuffix, "its path ends in \" (agent)\""),
+        ];
+        for (refusal, cause) in rows {
+            assert_eq!(refusal.describe(), cause, "{refusal:?}");
+        }
+    }
+
+    /// An image shows its label, never the cache file's name; a copied file shows
+    /// its own name, whatever it holds; a path with no file name falls back to the
+    /// whole path. Every one carries its number.
+    #[test]
+    fn attachment_placeholder_names_an_image_or_the_copied_file() {
+        use AttachmentKind::{File, Image};
+        let rows = [
+            (Image, "/cfg/cache/paste/paste-1-2.png", 1, "[Image #1]"),
+            (File, "/tmp/report.pdf", 2, "[report.pdf #2]"),
+            (File, "/tmp/my doc.pdf", 3, "[my doc.pdf #3]"),
+            (File, "/tmp/снимок.png", 4, "[снимок.png #4]"),
+            (File, "/tmp/[draft] v2.pdf", 5, "[[draft] v2.pdf #5]"),
+            (File, "/Users/me/Documents", 6, "[Documents #6]"),
+            (File, "/", 7, "[/ #7]"),
+        ];
+        let wrong: Vec<String> = rows
+            .into_iter()
+            .filter_map(|(kind, path, number, want)| {
+                let got = attachment_placeholder(kind, Path::new(path), number);
+                (got != want).then(|| format!("{path:?} #{number}: {got:?} != {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[test]
+    fn mention_insert_text_spaces_by_what_precedes_the_caret() {
+        let m = |s: &[&str]| s.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        assert_eq!(mention_insert_text(None, &m(&["@\"/a\""])), "@\"/a\" ");
+        assert_eq!(mention_insert_text(Some(' '), &m(&["@\"/a\""])), "@\"/a\" ");
+        assert_eq!(
+            mention_insert_text(Some('x'), &m(&["@\"/a\""])),
+            " @\"/a\" "
+        );
+        assert_eq!(
+            mention_insert_text(None, &m(&["@\"/a\"", "@\"/b\""])),
+            "@\"/a\" @\"/b\" "
+        );
+    }
+
+    /// A NEL is not a boundary for claude, so a placeholder after one is led by a
+    /// space; a boundary character, `。` or a BOM among them, needs none.
+    #[test]
+    fn mention_insert_text_leads_a_space_after_a_nel_and_none_after_a_boundary() {
+        let one = vec!["@\"/a\"".to_owned()];
+        assert_eq!(mention_insert_text(Some('\u{85}'), &one), " @\"/a\" ");
+        for boundary in ['\t', '\u{feff}', '\u{3000}', '。'] {
+            assert_eq!(
+                mention_insert_text(Some(boundary), &one),
+                "@\"/a\" ",
+                "{boundary:?}"
+            );
+        }
+    }
+
+    /// Every member of JavaScript's `\s` plus `。、？！` is a boundary, and the
+    /// near misses are not: NEL (Rust whitespace, not JavaScript's), the zero-width
+    /// space (U+200B, in neither), the ASCII lookalike `?`, and a letter.
+    #[test]
+    fn is_mention_boundary_is_javascripts_whitespace_plus_the_cjk_marks() {
+        let members = ('\u{9}'..='\u{d}')
+            .chain([' ', '\u{a0}', '\u{1680}'])
+            .chain('\u{2000}'..='\u{200a}')
+            .chain(['\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}'])
+            .chain(['\u{feff}', '。', '、', '？', '！']);
+        let missed: Vec<char> = members.filter(|c| !is_mention_boundary(*c)).collect();
+        assert!(missed.is_empty(), "not boundaries: {missed:?}");
+        let wrongly: Vec<char> = [
+            '\u{85}', '\u{200b}', '\u{2060}', '?', 'x', '"', '@', '\u{8}', '\u{e}',
+        ]
+        .into_iter()
+        .filter(|c| is_mention_boundary(*c))
+        .collect();
+        assert!(wrongly.is_empty(), "wrongly boundaries: {wrongly:?}");
     }
 }

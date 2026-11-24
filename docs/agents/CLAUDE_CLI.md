@@ -55,7 +55,10 @@ are behaviour probes, not `--help` captures, and the refresh below does not
 re-verify them.
 The two `Ctrl-X f` fork rows in [How snapback drives `claude`](#how-snapback-drives-claude)
 carry their own check against 2.1.291 (its `--help`, and probes of both forms),
-stated in each row.
+stated in each row. So does the
+[`@"<path>"` file mention](#file-mentions-reach-claude-bare-paths-do-not) the
+compose attach sends: measured at 2.1.289, re-verified at 2.1.296, with its own
+re-verify recipe.
 
 - **Installed == pinned** → this doc matches the live CLI. Trust it.
 - **Installed < pinned** → the local install is **behind this doc**. Newer flags
@@ -409,6 +412,160 @@ ordinary success rather than to a fabricated failure.
 snapback neither sets nor overrides claude's background-wait ceiling: the ceiling
 is claude's to own, and snapback's job is only to REPORT what it did. Do not add
 an env override to paper over it.
+
+### File mentions reach claude, bare paths do not
+
+> **Measured against `claude 2.1.289` (darwin), 2026-10-06; re-verified against
+> `claude 2.1.296`, 2026-10-11, the day the headless fork path was probed too.**
+> This section carries its own version and is not covered by the
+> [version pin](#version-pin-self-healing).
+
+The compose attach ([DOMAIN.md](DOMAIN.md#compose-attach-ctrl-v)) shows a
+placeholder in the draft and SENDS the `@"<absolute path>"` mention it expands the
+placeholder into, never a bare path, because of what a `claude -p` turn does with
+each:
+
+- A BARE absolute path outside the session's cwd gets the Read tool DENIED
+  (`permission_denials` lists a Read of that file), for an image and a text file
+  alike: a `-p` run has nobody to approve it.
+- `@/abs/path.png` and `@"/abs/path with space.png"` were attached by claude's own
+  input processing in ONE turn with no denial, outside the cwd. The transcript
+  records `{"type":"attachment","attachment":{"type":"file",…,"content":{"type":"image","file":{"base64":…}}}}`,
+  so the image is embedded at send time and a later resume never needs the file.
+- Text, images, PDFs and folders are read. A binary the Read tool cannot process
+  (a `.docx`) is named only ("a binary file the Read tool cannot process").
+- Probed on the reply argv (`claude -p -r <id>`) and on plain `claude -p`, with
+  `--model haiku`, `--permission-mode default` and hooks off, in a throwaway cwd
+  with the files in a sibling folder, and on the `Ctrl-X f` fork box's headless
+  `-p -r … --fork-session` the same way (the fork probe below). NOT probed with a
+  mention: `claude --bg` (why is below) and the interactive `Ctrl-O` runs.
+
+**The extractor**, read from the claude bundles directly: 2.1.289 on 2026-10-06
+(the unquoted form re-read 2026-10-11) and 2.1.306 on 2026-10-22. snapback writes
+ONLY the quoted form, so the quoted rule is the one it depends on:
+
+- quoted: `(^|[\s。、？！])@"([^"]+)"`, and a quoted name ending in ` (agent)` is
+  dropped. 2.1.289's `mnn` holds it as a regex literal; 2.1.306's `XDr` builds the
+  same rule with ``new RegExp(String.raw`(^|${lX})@"([^"]+)"`,"g")``, where
+  ``lX=String.raw`[\s${"。、？！"}]` `` (the marks are `ORe`; the bundle spells them
+  as `\u3002\u3001\uFF1F\uFF01` escapes). The class is JavaScript's `\s` (U+0009 to
+  U+000D, U+0020, U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F,
+  U+3000 and U+FEFF) plus those four marks. Rust's `char::is_whitespace` differs
+  both ways (it takes U+0085 NEL and lacks U+FEFF), so
+  `complete::is_mention_boundary` spells the set out and is the ONE predicate every
+  boundary decision asks;
+- unquoted: in 2.1.289 a regex, `(^|[\s。、？！])@([^\s]+)\b`, run over the SAME
+  text, so an `@` right after whitespace or one of `。、？！` INSIDE a quoted path
+  starts a second mention. In 2.1.306 it is no longer a regex: `XDr` runs its
+  quoted regex AND the hand-written scanner `wTn(e,!1)`, dropping only the
+  scanner's results that start with `"` (2.1.296 did a whitespace word scan with
+  the same prefix set). `wTn` walks `/[^\s]+/g` tokens with no quote awareness and,
+  per token, takes an `@` at the token's start (the text's start or after
+  whitespace), else a later `@` right after one of `。、？！`. So
+  `MentionRefusal::HiddenMention` is still NEEDED in 2.1.306: an `@` after
+  whitespace INSIDE a quoted path yields a second mention. Evidence, read from the
+  installed 2.1.306 binary on 2026-10-23 (`grep -a`) and checked by RUNNING the
+  extracted `XDr`, `wTn` and `aQt` under node (claude itself was not run): on
+  `@"/tmp/a @b/c.png"` the result is `["/tmp/a @b/c.png","b/c.png"]`. The same
+  holds after a tab, U+00A0, U+3000 or U+FEFF; after a NEL or U+200B it does not.
+  For `。、？！` the refusal is broader than 2.1.306 needs: in the token that starts
+  with `@"` the mark branch is never reached, so `@"/tmp/x。@b.png"` yields no
+  second mention, while `@"/tmp/a b。@c.png"` yields `c.png` (the mark splits one
+  off only after earlier whitespace in the path). Not verified: `D`'s real
+  definition (an identity stand-in was used) and which `wTn` the call binds (the
+  two-argument scanner sits right after `XDr`; the one-argument `wTn(e)` elsewhere
+  in the bundle is an unrelated slot limiter, so the binding is inferred from
+  adjacency and arity). The agent-mention forms (`vTn`) keep
+  `(^|${lX})@"…(agent)"` and `(^|${lX})@(agent-…)`;
+- the name is then parsed by `^([^#]+)(?:#L(\d+)(?:-(\d+))?)?(?:#[^#]*)?$`, so a
+  `#` truncates the path (`bmr` in 2.1.289, `eLr` in 2.1.306, unchanged).
+
+`complete::file_mention` refuses every path these rules cannot carry; the refusal
+table is [DOMAIN.md](DOMAIN.md#compose-attach-ctrl-v)'s. A changed extractor
+means changing `file_mention` and its test
+(`file_mention_quotes_what_claude_can_carry_and_refuses_the_rest`) with it.
+
+**Re-verified 2026-10-11 against `claude 2.1.296`** with the recipe below: the
+bare out-of-cwd path took `num_turns` 2 with `permission_denials` holding the Read
+of that file; the `@"…"` form took `num_turns` 1 with no denials and described the
+image correctly. About $0.006 in all.
+
+To re-verify after a `claude` update, in a THROWAWAY folder:
+
+```sh
+mkdir -p /tmp/sb-probe/cwd /tmp/sb-probe/files && cd /tmp/sb-probe/cwd
+# any small PNG at /tmp/sb-probe/files/shot.png
+probe() { claude -p --model haiku --no-session-persistence --strict-mcp-config \
+  --settings '{"disableAllHooks":true}' --permission-mode default --output-format json "$1"; }
+probe "Describe /tmp/sb-probe/files/shot.png in one sentence."     # expect permission_denials non-empty
+probe 'Describe @"/tmp/sb-probe/files/shot.png" in one sentence.'  # expect num_turns 1, no denials
+```
+
+Both results must hold; if either differs, the attach needs rework.
+`--no-session-persistence` wrote no transcript at 2.1.296, but claude still
+created an empty `~/.claude/projects/<encoded-cwd>/memory/` folder for the
+throwaway cwd (the model-call side effect the
+[handshake section](#the-initialize-control-handshake-compose-pick-list) records
+too): delete it, and `/tmp/sb-probe`, afterwards.
+
+**The headless fork, probed 2026-10-11 against `claude 2.1.296`** (darwin): the
+`Ctrl-X f` box's `Enter` argv carries a mention as the reply argv does. In a
+throwaway `<tmp>/cwd`, with a 64×64 red PNG at `<tmp>/files/red square.png`, a
+persisted seed (`claude -p "Reply with the single word: seed"`, since a fork needs
+its parent on disk) was forked in `send::build_fork_send_argv`'s flag order, the
+probe's own flags after snapback's and the message ONE trailing element,
+`<fork name>` being `resume::fork_name` of that message:
+
+```sh
+claude -p -r <seed-id> --fork-session --session-id <fork-id> --name <fork name> \
+  --output-format json --model haiku --permission-mode default \
+  --settings '{"disableAllHooks":true}' --strict-mcp-config \
+  '@"<tmp>/files/red square.png" What colour is this image? Answer with one word.'
+```
+
+- `num_turns` 1, `permission_denials` `[]`, `result` `"Red"`, and `session_id`
+  the `--session-id` given, not the seed's. $0.0058 for the fork, $0.009 with the
+  seed.
+- The NEW `<fork-id>.jsonl` holds exactly one
+  `{"type":"attachment","attachment":{"type":"file","filename":"<tmp>/files/red square.png","content":{"type":"image","file":{"base64":…,"type":"image/png","originalSize":132,"dimensions":{…}}},"displayPath":"../files/red square.png"},…}`
+  record, its base64 the file's exact bytes, so a fork embeds the image as a reply
+  does. No assistant record called a tool.
+- The seed's `<seed-id>.jsonl` stayed byte-identical (same md5 before and after)
+  and holds no `file` attachment.
+- `~/.claude.json` gained no `projects` entry for the temp folder. The shell
+  carried another claude session's markers (`CLAUDE_CODE_CHILD_SESSION` among
+  them), and `-p` still wrote both transcripts.
+
+Still NOT probed, each for a reason:
+
+- **The `Ctrl-N` draft's `claude --bg`.** It refuses an untrusted temp folder, and
+  trusting one means writing `~/.claude.json`, which snapback and its probes never
+  do; a probe in a real, trusted project would start a live background agent.
+- **What each terminal's `Cmd+V` delivers**
+  ([DOMAIN.md](DOMAIN.md#compose-attach-ctrl-v)): GUI behaviour no headless run
+  reaches, so it is a manual check per terminal, not a probe.
+
+To re-verify the fork path after a `claude` update, in a THROWAWAY folder (unlike
+the recipe above, it PERSISTS both transcripts):
+
+```sh
+d="$(cd "$(mktemp -d /tmp/sb-fork-probe.XXXXXX)" && pwd -P)" \
+  && mkdir "$d/cwd" "$d/files" && cd "$d/cwd"
+# any small PNG at "$d/files/red square.png" (keep the space)
+flags=(--output-format json --model haiku --permission-mode default
+  --settings '{"disableAllHooks":true}' --strict-mcp-config)
+seed="$(claude -p "Reply with the single word: seed" "${flags[@]}" | jq -r .session_id)"
+fork="$(uuidgen | tr 'A-Z' 'a-z')"
+claude -p -r "$seed" --fork-session --session-id "$fork" --name "fork: probe" "${flags[@]}" \
+  "@\"$d/files/red square.png\" What colour is this image? Answer with one word."
+# expect num_turns 1, permission_denials [], session_id == $fork, a red reply
+grep -c '"attachment":{"type":"file"' ~/.claude/projects/*/"$fork.jsonl"  # expect 1
+grep -c '"attachment":{"type":"file"' ~/.claude/projects/*/"$seed.jsonl"  # expect 0
+```
+
+Every expectation must hold; if one differs, a fork's attach needs rework. At
+2.1.296 the throwaway cwd's `~/.claude/projects/<encoded-cwd>/` held only the two
+`<id>.jsonl` and an empty `memory/`: delete that folder, and `$d`, afterwards.
 
 ## The `initialize` control handshake (compose pick list)
 

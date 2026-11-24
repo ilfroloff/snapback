@@ -84,7 +84,7 @@ All keys: `sb --help` · Full guide: [docs/GUIDE.md](docs/GUIDE.md)
 
 ## Safety
 
-snapback reads your sessions; the only file it writes is its hidden-session list under `~/.config/snapback`. Delete always asks first.
+snapback reads your sessions; the only files it writes are its hidden-session list and, when you attach a clipboard image, a copy of that image (owner-only, pruned after 7 days), both under `~/.config/snapback`. Delete always asks first.
 
 ## Requirements
 

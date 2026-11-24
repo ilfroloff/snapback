@@ -23,7 +23,9 @@ find the same rule in two places, that is a bug to fix.
    session's title, the answering model
    and the one a `-r` launch restores, scopes, the per-compose model pick and
    its defaults, the compose pick list, how it matches and where it reads
-   from), and the per-state routing tables — the hand-offs, the `Ctrl-X f` fork
+   from, the compose attach — what `Ctrl-V` reads from the OS clipboard, the
+   placeholder the draft shows, the `@"<path>"` mention it expands into, its
+   refusals and the paste cache), and the per-state routing tables — the hand-offs, the `Ctrl-X f` fork
    box, the `Ctrl-R` / `Ctrl-K` gates, the row role (head row or `↳` row, and
    for `Ctrl-X x` whether the row visibly stands for others and which members it
    shows) that decides how far `Ctrl-X x` / `d` / `w` reach, the `Ctrl-X w`
@@ -33,7 +35,7 @@ find the same rule in two places, that is a bug to fix.
    implementation rules and the testing conventions to match.
 5. [OPERATIONS.md](OPERATIONS.md) — build/test/lint/run commands, the
    environment it reads (the `CLAUDE_PROJECTS_DIR` / `SNAPBACK_CONFIG_DIR`
-   overrides, the session facts the clipboard copy routes by, `claude`'s own
+   overrides, the session facts the clipboard copy and read route by, `claude`'s own
    model variables the compose boxes' `model:` labels read, and the two that
    locate claude's workspace-trust record), the runtime
    prerequisites, the hidden `--print-list` mode, the CI, coverage and
@@ -54,7 +56,9 @@ find the same rule in two places, that is a bug to fix.
    forms it resolves) with the workspace-trust rule that picks its two forms
    (argv and child environment) and what a never-trusted folder can run under `-p` (its settings, and claude's
    own git prefetch), the `set_cwd` control request the `Ctrl-X w` move sends
-   (also pinned at its own version, with claude's own `/cd` beside it), and the
+   (also pinned at its own version, with claude's own `/cd` beside it), why the
+   compose attach writes an `@"<path>"` mention rather than a bare path (with the
+   mention extractor read out of the binary, also at its own version), and the
    background-session commands — `stop`/`attach`, which it depends on, and the
    ones it deliberately does not use.
 
@@ -67,10 +71,10 @@ install and quick start only.
 | Topic | Lives in |
 | --- | --- |
 | Module responsibilities, stack, runtime wiring | ARCHITECTURE |
-| Store layout, JSONL fields, label/grouping/fork-lineage (named forks included)/turn-count/live-agent/answering-model semantics, the delegation line, the subagent view, the preview's find bar, the subagent record's running rule, the running list and the session's title, the per-compose model pick and its `ComposeDefault` cases, the compose pick list's sources, precedence, fetch/retry behaviour and how it matches, marks and orders, and the routing tables (hand-off, the `Ctrl-X f` fork box, `Ctrl-R`, `Ctrl-K`, the head-row / `↳`-row reach of `Ctrl-X x` / `d` / `w` and hide's narrower stands-for-others reach and on-screen set, the `Ctrl-X w` move, its lineage job and a quit mid-move, `Event::Paste`) | DOMAIN |
+| Store layout, JSONL fields, label/grouping/fork-lineage (named forks included)/turn-count/live-agent/answering-model semantics, the delegation line, the subagent view, the preview's find bar, the subagent record's running rule, the running list and the session's title, the per-compose model pick and its `ComposeDefault` cases, the compose pick list's sources, precedence, fetch/retry behaviour and how it matches, marks and orders, the compose attach (its placeholder and mention forms, the `@` boundary, refusals, copied-file upgrade, the clipboard tools' steps and exits, and the paste cache), and the routing tables (hand-off, the `Ctrl-X f` fork box, `Ctrl-R`, `Ctrl-K`, the head-row / `↳`-row reach of `Ctrl-X x` / `d` / `w` and hide's narrower stands-for-others reach and on-screen set, the `Ctrl-X w` move, its lineage job and a quit mid-move, `Event::Paste`) | DOMAIN |
 | How the critical rules are carried out in code (fail-soft direction, authoritative re-read, matcher isolation, styling, off-thread shapes, status ownership), the tunables table, testing conventions | PATTERNS |
 | Commands, env vars, CI + release automation, validation checklist | OPERATIONS |
-| External `claude` CLI surface (flags, commands, version pin, spawned argv, the captured `--model` alias set + its refresh command, the `--effort` levels and how claude treats them, the settings precedence and `-r` model restore a launch without `--model` follows, the `initialize` handshake's probed wire shape and side effects, the built-ins and skills claude hides from its `/` menu, the agent-mention forms, claude's workspace-trust record and rule, what an untrusted folder can run (claude's own git prefetch included), and the fetch's two forms, argv and child environment; the `set_cwd` move request's probed wire shape and answers, what its child does once snapback is gone, and claude's own `/cd`) | CLAUDE_CLI |
+| External `claude` CLI surface (flags, commands, version pin, spawned argv, the captured `--model` alias set + its refresh command, the `--effort` levels and how claude treats them, the settings precedence and `-r` model restore a launch without `--model` follows, the `initialize` handshake's probed wire shape and side effects, the built-ins and skills claude hides from its `/` menu, the agent-mention forms, claude's workspace-trust record and rule, what an untrusted folder can run (claude's own git prefetch included), and the fetch's two forms, argv and child environment; the `set_cwd` move request's probed wire shape and answers, what its child does once snapback is gone, and claude's own `/cd`; what claude does with a bare path and with an `@"<path>"` mention, and its mention extractor and the `@` boundary it accepts) | CLAUDE_CLI |
 | The runtime readers of that alias set (`model_aliases`), of the settings default and restore override (`claude_settings`) and of claude's workspace-trust verdict (`claude_trust`), and how their answers reach the compose boxes and the `Ctrl-X w` move | ARCHITECTURE |
 | The critical rules themselves + engineering principles (the authoritative wording: the files above own each rule's mechanism, and where one still repeats a rule, AGENTS.md's statement wins) | AGENTS.md |
 
@@ -87,4 +91,4 @@ the live CLI per its own
 [Refreshing this doc](CLAUDE_CLI.md#refreshing-this-doc) section; its separately
 pinned `initialize` handshake section carries its own re-verify commands, the
 hidden-built-ins, workspace-trust, git-prefetch and `rootOnly` checks among them,
-and so does its separately pinned `set_cwd` section.
+and so do its separately pinned `set_cwd` and file-mention sections.
