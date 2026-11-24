@@ -1,0 +1,87 @@
+name: "🧩 Publish VS Code Extension"
+
+# Builds the VS Code extension (.vsix) and attaches it to the GitHub Release
+# created by release-plz. The extension is a separate artifact from the Rust
+# binary — it lives in editors/vscode/ and is a Node.js/TypeScript wrapper that
+# opens snapback in a fullscreen terminal pane.
+#
+# WHY A TAG TRIGGER: same reason as npm-release.yml — release-plz cuts the tag
+# using a PAT, which triggers downstream workflows. This workflow builds the
+# .vsix and attaches it to the release so users can download it directly.
+#
+# NO LOOP: nothing here pushes a commit or a tag. It only reads the tag, builds,
+# and attaches an asset to an existing release.
+#
+# NOT release-plz's job: release-plz is deliberately git-only and manages the
+# Rust crate. The VS Code extension is a separate artifact with its own version
+# (in editors/vscode/package.json), so it is a separate workflow keyed off the
+# same tag.
+
+on:
+  push:
+    tags: ["v*"]
+
+# Least privilege: contents: write is needed to attach the .vsix to the release.
+permissions:
+  contents: write
+
+# Never attach the same tag twice concurrently.
+concurrency:
+  group: vscode-extension-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: "🔨 Build VS Code Extension"
+    runs-on: ubuntu-latest
+    steps:
+      - name: "📥 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🟢 Set up Node"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: "📦 Install dependencies"
+        working-directory: editors/vscode
+        run: npm install
+
+      - name: "🔨 Compile TypeScript"
+        working-directory: editors/vscode
+        run: npm run compile
+
+      - name: "📦 Package .vsix"
+        working-directory: editors/vscode
+        run: npx vsce package --allow-missing-repository
+
+      - name: "⬆️ Upload .vsix artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: vscode-extension
+          path: editors/vscode/*.vsix
+          if-no-files-found: error
+          retention-days: 1
+
+  attach:
+    name: "📎 Attach to GitHub Release"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: "⬇️ Download .vsix artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: vscode-extension
+          path: .
+
+      - name: "📎 Attach .vsix to release"
+        run: |
+          vsix_file=$(ls *.vsix | head -n 1)
+          if [ -z "$vsix_file" ]; then
+            echo "::error::No .vsix file found"
+            exit 1
+          fi
+          echo "Attaching $vsix_file to release ${GITHUB_REF_NAME}"
+          gh release upload "${GITHUB_REF_NAME}" "$vsix_file" --clobber
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
